@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "whisperdrz"
+version = "0.1.0"
+description = "Speaker-aware ASR with word-level timestamps (inference)"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+dependencies = [
+    "torch",
+    "torchaudio",
+    "torchcodec",
+    "numpy",
+    "scipy",
+    "einops",
+    "numba",
+    "tiktoken",
+    "safetensors",
+    "huggingface_hub",
+]
+
+[project.optional-dependencies]
+flash = ["flash-attn", "triton"]
+demo = ["gradio"]
+eval = ["jiwer", "whisper-normalizer"]
+
+[project.scripts]
+whisperdrz = "whisperdrz.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["whisperdrz*"]
+
+[tool.setuptools.package-data]
+whisperdrz = ["assets/*.tiktoken"]
