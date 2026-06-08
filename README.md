@@ -8,6 +8,10 @@ chunking and stitching internally.
 This repository is inference only. Weights are distributed on the Hugging Face
 Hub at [`fluxions/whisperdrz`](https://huggingface.co/fluxions/whisperdrz).
 
+📖 **Full write-up** — how it works, the timing-token and diarization approach,
+honest results (WER, DER, timing, events, multilingual), and what didn't work:
+**[blog.md](blog.md)**.
+
 ## Install
 
 ```bash

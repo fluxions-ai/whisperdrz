@@ -255,11 +255,11 @@ And per-language work is the deeper point. WhisperDRZ's real inference path appl
 
 </details>
 
-So the honest claim is narrower than "WhisperDRZ retains all of Whisper's languages." It's: **WhisperDRZ keeps strong transcription across the major world languages, regresses clearly on Chinese, and degrades across most lower-resource languages** — the inference masking would need per-language tuning, and several languages would want dedicated data. Unlike some of the English numbers above, these are measured on the released weights, so they're not provisional.
+So the honest claim is narrower than "WhisperDRZ retains all of Whisper's languages." It's: **WhisperDRZ keeps strong transcription across the major world languages, regresses clearly on Chinese, and degrades across most lower-resource languages** — the inference masking would need per-language tuning, and several languages would want dedicated data.
 
 ## What I'd do next
 
-**Move to audio codecs.** It was obvious from the start that the right substrate for this is a discrete audio codec, not 16 kHz mel features — it would unlock hours of context and higher-fidelity event detection. Training a codec and a model on top of it was simply out of budget and bandwidth for a one-person lab, and would have meant sourcing a huge from-scratch dataset. But it's the clear path forward.
+**Move to audio codecs.** It was obvious from the start that the right substrate for this is a discrete audio codec, not 16 kHz mel features — it would unlock hours of context and higher-fidelity event detection. Training a codec and a model on top of it was simply out of budget and bandwidth for a one-person, and would have meant sourcing a huge from-scratch dataset. But it's the clear path forward.
 
 **In-context speaker ID.** With long context you can do what I showed working in nanodrz: prompt each new chunk with a few labelled chunks from earlier in the same recording, so the model carries speaker identity forward *in context*. That throws away the whole flawed embedding-and-clustering pipeline and makes streaming natural. (Recent systems like VibeVoice-ASR point in a similar direction.)
 
