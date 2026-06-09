@@ -1,8 +1,8 @@
 # WhisperDRZ: teaching Whisper to hear who said what
 
-Most ASR systems answer one question: *what words were said?* But that's not what listening is. When you hear a conversation you also know *who* spoke, when they overlapped, when someone took a breath, hesitated, or laughed. Those signals are most of what makes speech feel human, and they're exactly what transcription throws away.
+Most ASR systems answer one question: *what words were said?* But that's not what listening is. When you hear a conversation you also know *who* spoke, when they overlapped, when someone took a breath, hesitated, or laughed, or stammered on some words. Those signals are most of what makes speech feel human, and they're exactly what transcription throws away.
 
-WhisperDRZ is a fine-tune of Whisper-large-v3 that tries to keep them. It transcribes, diarizes (labels who said what), predicts word-level timings that tolerate overlapping speech, and emits non-speech events like `[breath]` and `[hesitate]`. The longer-term goal was never transcription for its own sake — it was to build the listening half of a speech system with enough understanding of *what is actually happening* in audio to eventually generate it with the same realism.
+WhisperDRZ is a fine-tune of [Whisper-large-v3](https://github.com/openai/whisper) that tries to keep them. It transcribes, diarizes (labels who said what), predicts word-level timings that tolerate overlapping speech, and emits non-speech events like `[breath]` and `[hesitate]`. The longer-term goal was never transcription for its own sake — it was to build the listening half of a speech system with enough understanding of *what is actually happening* in audio to eventually generate it with the same realism.
 
 This is a write-up of what worked, what didn't, and what I'd do with more than a one-person research budget. The bulk of this work was done in 2025; the released checkpoint was finalized in early 2026.
 
@@ -12,13 +12,14 @@ Every number below is measured on the **publicly released checkpoint**, so it's 
 
 | Capability | Metric (dataset) | WhisperDRZ | Reference |
 |---|---|---|---|
-| Transcription, clean English | WER (ESB, 1000) | **9.6%** macro / 5.9% micro | whisper-large-v3: 7.4% |
+| Transcription, clean English | WER ([ESB](https://huggingface.co/datasets/esb/datasets), 1000) | **9.6%** macro / 5.9% micro | whisper-large-v3: 7.4% |
 | Transcription, conversational | WER (internal, 26) | 11.1% | — |
-| Diarization | DER (VoxConverse dev) | 40.7% (overlap **63.4%**) | specialist systems ~10–25% |
+| Number formatting | format-exact / digit-recall (267) | 23.6% / 34.8% | whisper-large-v3: 32.2% / 59.9% |
+| Diarization | DER ([VoxConverse](https://github.com/joonson/voxconverse) dev) | 40.7% (overlap **63.4%**) | specialist systems ~10–25% |
 | Speaker attribution | WDER (internal) | 33% | no-linking baseline: ~42% |
 | Word timing | MAE (full pipeline) | median ~90 ms (mean ~1.5 s) | — |
 | Non-speech events | NSER (internal) | ~59% | — |
-| Multilingual | WER/CER (FLEURS) | <7% on major langs; degrades low-resource | — |
+| Multilingual | WER/CER ([FLEURS](https://huggingface.co/datasets/google/fleurs)) | <7% on major langs; degrades low-resource | — |
 
 The rest of this post is how each of those works, and where the numbers come from.
 
@@ -100,10 +101,10 @@ The natural worry: piling diarization, timings and event tags onto Whisper shoul
 
 | Model | Avg WER (ESB) | Notes |
 |---|---|---|
-| whisper-large-v3 (baseline) | 7.44% | Open ASR Leaderboard |
+| whisper-large-v3 (baseline) | 7.44% | [Open ASR Leaderboard](https://github.com/huggingface/open_asr_leaderboard) |
 | **WhisperDRZ large-v3 (released, step 850)** | **9.61%** | full ESB, 1000 samples (micro 5.88%) |
 
-So the full speaker-aware, event-aware, timing-aware model costs about **2 points of WER** over the base model (9.6% vs 7.4% macro) — a modest price for everything it adds, and on clean LibriSpeech the gap is much smaller. Some of getting that number down was *decoding* discipline rather than training — on an earlier, shakier checkpoint, tightening the inference guardrails and dropping a few pathological token classes took WER from ~18% to ~7%. (On the released model the guardrails matter much less — see the ablation above.)
+So the full speaker-aware, event-aware, timing-aware model costs about **2 points of WER** over the base model (9.6% vs 7.4% macro) — a modest price for everything it adds, and on clean [LibriSpeech](https://www.openslr.org/12) the gap is much smaller. Some of getting that number down was *decoding* discipline rather than training — on an earlier, shakier checkpoint, tightening the inference guardrails and dropping a few pathological token classes took WER from ~18% to ~7%. (On the released model the guardrails matter much less — see the ablation above.)
 
 ### A note on these numbers
 
@@ -111,9 +112,39 @@ Every headline number in this post — this ESB WER, the VoxConverse DER below, 
 
 It's also cheap to run: WhisperDRZ reaches ~92x real-time on a single GPU, which works out to roughly $0.01 per hour of audio on a commodity cloud GPU — about 36x cheaper than calling a hosted Whisper API, with diarization included rather than billed separately.
 
+## Numbers: still spoken, not written
+
+A specific weakness worth naming: WhisperDRZ doesn't reliably render spoken numbers in their *written* form. Say a phone number out loud and you want `07700 900123`, not "oh seven seven oh oh…"; a price should come back as `£91.09`, a date as `2025-02-15`.
+
+On a dedicated 267-clip eval across 11 categories (phone, money, date, time, version, fraction, measurement, score, ordinal, IP, code), the released checkpoint hits **23.6% format-exact / 34.8% digit-recall** — *behind* whisper-large-v3's **32.2% / 59.9%**. The dominant failure isn't wrong digits, it's leaving the number as words entirely: **37% of clips emit no digits at all.** The one place it clearly wins is ISO dates (`2025-02-15`), a format the base model never produces.
+
+The digits *are* present in the training targets, so this reads as a data-proportion / undertraining issue rather than a wrong-objective one — more correctly-formatted number data, or longer training on it, should close the gap. For now, don't rely on WhisperDRZ for structured numeric transcription. (Standard WER hides this entirely: Whisper's text normalizer collapses `747` to "seven hundred forty seven", so this eval scores against un-normalized ground truth on both format-exact and digit-recall.)
+
+<details>
+<summary>Full per-category breakdown (267 clips)</summary>
+
+| category | n | WhisperDRZ format | large-v3 format | WhisperDRZ digit-recall | large-v3 digit-recall |
+|---|---|---|---|---|---|
+| phone | 25 | 28% | 32% | 28% | 76% |
+| money | 25 | 8% | 16% | 40% | 80% |
+| date | 25 | 12% | 0% | 12% | 0% |
+| time | 25 | 4% | 0% | 32% | 44% |
+| version | 25 | 44% | 36% | 72% | 100% |
+| fraction | 17 | 0% | 0% | 12% | 0% |
+| measurement | 25 | 20% | 20% | 28% | 44% |
+| score | 25 | 28% | 44% | 28% | 56% |
+| ordinal | 25 | 36% | 76% | 36% | 76% |
+| ip | 25 | 20% | 72% | 24% | 84% |
+| code | 25 | 52% | 48% | 64% | 80% |
+| **overall** | **267** | **23.6%** | **32.2%** | **34.8%** | **59.9%** |
+
+*format-exact* = the expected written string appears in the output (ignoring spacing/case); *digit-recall* = the expected digit sequence appears, any format. WhisperDRZ = released step-850 checkpoint.
+
+</details>
+
 ## How good is the diarization, really?
 
-Transcription is the easy part; "who said what" is the harder claim, so I measured it on a public benchmark — **VoxConverse**, in-the-wild conversational video (interviews, debates, panel shows) with heavy overlap. The metric is **diarization error rate (DER)**: missed speech + false alarm + speaker confusion, over total reference speech, at the standard 0.25s collar. This runs the full production pipeline — chunked decoding, DTW word timings, and ECAPA2 cross-chunk speaker linking.
+Transcription is the easy part; "who said what" is the harder claim, so I measured it on a public benchmark — **VoxConverse**, in-the-wild conversational video (interviews, debates, panel shows) with heavy overlap. The metric is **diarization error rate (DER)**: missed speech + false alarm + speaker confusion, over total reference speech, at the standard 0.25s collar. This runs the full production pipeline — chunked decoding, DTW word timings, and [ECAPA2](https://huggingface.co/Jenthe/ECAPA2) cross-chunk speaker linking.
 
 | VoxConverse dev (216 files) | DER |
 |---|---|
@@ -123,7 +154,7 @@ Transcription is the easy part; "who said what" is the harder claim, so I measur
 
 The honest read:
 
-- **~41% DER overall.** Specialist diarizers (pyannote, the VoxSRC challenge systems) land roughly in the **10–25%** range on this data. So WhisperDRZ — an ASR-first model with diarization folded into its output format — is *usable* but **not competitive with purpose-built diarization systems**.
+- **~41% DER overall.** Specialist diarizers ([pyannote](https://github.com/pyannote/pyannote-audio), the [VoxSRC](https://mm.kaist.ac.kr/datasets/voxceleb/voxsrc/workshop.html) challenge systems) land roughly in the **10–25%** range on this data. So WhisperDRZ — an ASR-first model with diarization folded into its output format — is *usable* but **not competitive with purpose-built diarization systems**.
 - **Overlap is the weak spot (63% DER).** This is the most important correction to the optimistic framing earlier in this post. WhisperDRZ can *represent* overlapping speech in its channel format, but actually getting overlap *right* on real, crowded audio is much harder than the format makes it look. Overlap is an open problem here, not a solved feature.
 - **Cross-chunk speaker linking matters enormously.** Without the ECAPA2 step, speaker labels scramble across 30-second chunks and DER roughly doubles. The embedding-based linking is doing a lot of the work — and, as the speaker section above admits, it's the least principled part of the system.
 - **No VAD = false alarm.** WhisperDRZ has no voice-activity gate, so it transcribes over music and silence; on VoxConverse clips that are mostly non-speech, that inflates false alarm (a few clips even exceed 100% DER, where hypothesis speech dwarfs the few seconds of real reference speech). A simple non-speech filter would recover a meaningful slice of this.
@@ -259,9 +290,14 @@ So the honest claim is narrower than "WhisperDRZ retains all of Whisper's langua
 
 ## What I'd do next
 
-**Move to audio codecs.** It was obvious from the start that the right substrate for this is a discrete audio codec, not 16 kHz mel features — it would unlock hours of context and higher-fidelity event detection. Training a codec and a model on top of it was simply out of budget and bandwidth for a one-person, and would have meant sourcing a huge from-scratch dataset. But it's the clear path forward.
+**Move to audio codecs.** It was obvious from the start that the right substrate for this is a discrete audio codec, not 16 kHz mel features — and ideally a **low-frame-rate** one, **sub-12.5 Hz** (where both Kyutai's [Mimi](https://github.com/kyutai-labs/moshi) and our own [vui](https://github.com/fluxions-ai/vui) codec sit), so each token covers more time, sequences stay short, context stretches to hours at low latency, and event detection gets higher-fidelity. Training a codec and a model on top of it was simply out of budget and bandwidth for one person, and would have meant sourcing a huge from-scratch dataset. But it's the clear path forward — and the substrate that makes everything below, streaming especially, tractable.
 
-**In-context speaker ID.** With long context you can do what I showed working in nanodrz: prompt each new chunk with a few labelled chunks from earlier in the same recording, so the model carries speaker identity forward *in context*. That throws away the whole flawed embedding-and-clustering pipeline and makes streaming natural. (Recent systems like VibeVoice-ASR point in a similar direction.)
+**In-context speaker ID.** With long context you can do what I showed working in [nanodrz](https://github.com/mogwai/nanodrz): prompt each new chunk with a few labelled chunks from earlier in the same recording, so the model carries speaker identity forward *in context*. That throws away the whole flawed embedding-and-clustering pipeline and makes streaming natural. The budget is realistic on a low-Hz codec: getting to ~12 minutes of context (only ~9k tokens at 12.5 Hz, fewer below that) is enough to carry a decent number of speakers forward from the previous inference chunk — they arrive **pre-identified**, so each new chunk just has to *match* against labelled exemplars rather than re-cluster from scratch. (Recent systems like [VibeVoice-ASR](https://github.com/microsoft/VibeVoice) point in a similar direction.)
+
+**Towards true streaming.** Everything here is chunked and offline — 30s windows, then external clustering stitched on top. On the low-Hz codec above, a genuinely streaming WhisperDRZ just needs a way to emit text *as the audio streams in*, via one of two routes:
+
+- **A delayed text channel** — [Kyutai's delayed-streams modeling](https://github.com/kyutai-labs/delayed-streams-modeling): model audio and text as parallel, time-aligned streams with the text delayed a fixed offset behind the audio (Kyutai run ~500 ms for their 1B, 2.5 s for the 2.6B). Text simply falls out of the logits as audio arrives — no wrapper logic — and you get word-level timestamps and a semantic "is the speaker done" VAD for free.
+- **Reverse the vui chunk format** — [vui](https://github.com/fluxions-ai/vui) (our TTS model) interleaves each short chunk as `[text → audio codes]`; flip it to `[audio codes → text]` and the exact same architecture becomes a chunked streaming ASR. That also unifies the listening and speaking halves into one format, which was the point all along.
 
 **A pure-diarization task.** Everything in this post couples diarization to transcription — the model has to *read* the words to assign speakers, and the cross-chunk linking then leans on an external embedder. One thing I'd like to try is training WhisperDRZ to do diarization *on its own*, with no transcription at all — a target that's just speaker lines and speech-region timestamps:
 

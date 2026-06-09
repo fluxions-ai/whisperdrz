@@ -10,7 +10,7 @@ Hub at [`fluxions/whisperdrz`](https://huggingface.co/fluxions/whisperdrz).
 
 📖 **Full write-up** — how it works, the timing-token and diarization approach,
 honest results (WER, DER, timing, events, multilingual), and what didn't work:
-**[blog.md](blog.md)**.
+**[writeup.md](writeup.md)**.
 
 ## Install
 
@@ -99,7 +99,7 @@ Measured on the released checkpoint:
 
 WhisperDRZ is an ASR-first model: transcription is strong, but diarization trails
 purpose-built systems (which reach ~10–25% DER on VoxConverse) and overlap is its
-weak spot. See [the write-up](blog.md) for full results (timing, non-speech
+weak spot. See [the write-up](writeup.md) for full results (timing, non-speech
 events, multilingual) and analysis.
 
 Reproduce WER/WDER on your own data with the metrics in `whisperdrz.evals` and the runner:
