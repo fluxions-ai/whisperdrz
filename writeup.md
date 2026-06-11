@@ -2,13 +2,15 @@
 
 Most ASR systems answer one question: *what words were said?* But that's not what listening is. When you hear a conversation you also know *who* spoke, when they overlapped, when someone took a breath, hesitated, or laughed, or stammered on some words. Those signals are most of what makes speech feel human, and they're exactly what transcription throws away.
 
-WhisperDRZ is a fine-tune of [Whisper-large-v3](https://github.com/openai/whisper) that tries to keep them. It transcribes, diarizes (labels who said what), predicts word-level timings that tolerate overlapping speech, and emits non-speech events like `[breath]` and `[hesitate]`. The longer-term goal was never transcription for its own sake — it was to build the listening half of a speech system with enough understanding of *what is actually happening* in audio to eventually generate it with the same realism.
+WhisperDRZ is a fine-tune of [Whisper-large-v3](https://github.com/openai/whisper) that tries to keep them. It transcribes, diarizes (labels who said what), predicts word-level timings that tolerate overlapping speech, and emits non-speech events like `[breath]` and `[hesitate]`, s-s-stutters, people cutting themselves off "hey would you-" etc. 
 
-This is a write-up of what worked, what didn't, and what I'd do with more than a one-person research budget. The bulk of this work was done in 2025; the released checkpoint was finalized in early 2026.
+The longer-term goal was never transcription for its own sake — it was to build the listening half of a speech system with enough understanding of *what is actually happening* in audio to eventually generate it with the same realism.
+
+This is a write-up of what worked, what didn't, and what I'd do with more budget. The bulk of this work was done in 2025; the released checkpoint was finalized in early 2026.
 
 ## Results at a glance
 
-Every number below is measured on the **publicly released checkpoint**, so it's what you'd actually get. The honest one-line summary: transcription is strong, timing is decent, diarization is usable but well behind specialist systems, and events/overlap are weak.
+Every number below is measured on the **publicly released checkpoint**, so it's what you'd actually get. The honest one-line summary: transcription is strong, timing is decent, diarization is usable but well behind specialist systems, and events are showing some signal, but need more data to improve further.
 
 | Capability | Metric (dataset) | WhisperDRZ | Reference |
 |---|---|---|---|
@@ -91,9 +93,11 @@ It wasn't. On real multi-speaker audio the integrated head was **no better than 
 
 So WhisperDRZ falls back to an external speaker-embedding model (ECAPA2) with per-line clustering to link speakers across chunks. It helps measurably — on the internal eval it brings word-diarization error rate down to about **33%, from ~42% with no cross-chunk linking** — but two things are worth being honest about: a third of words still land on the wrong speaker, and the whole approach leans on an unprincipled clustering step rather than something the model itself learned. The diarization quality you saw on VoxConverse above is *carried* by this external linker, not by WhisperDRZ's own speaker representation.
 
-So WhisperDRZ falls back to an external speaker embedding model (ECAPA2) with per-line clustering to link speakers across chunks. This works better in practice but I'm not happy with it: clustering is an inherently unstable, offline approach to speaker ID, and it makes true streaming hard (though not impossible). The right answer is in-context speaker identification — more on that below.
+Beyond the accuracy, clustering is an inherently unstable, offline approach to speaker ID, and it makes true streaming hard (though not impossible). The right answer is in-context speaker identification — more on that below.
 
 The honest summary: the integrated speaker head is a clean idea that didn't survive contact with real data, and I'm reporting it as a negative result rather than burying it.
+
+Perhaps this was a data problem in that our data wasn't clean enough, or perhaps the cross-entropy loss fought too hard with the various contrastive losses we experimented with.
 
 ## Does adding all this hurt transcription?
 
@@ -102,13 +106,13 @@ The natural worry: piling diarization, timings and event tags onto Whisper shoul
 | Model | Avg WER (ESB) | Notes |
 |---|---|---|
 | whisper-large-v3 (baseline) | 7.44% | [Open ASR Leaderboard](https://github.com/huggingface/open_asr_leaderboard) |
-| **WhisperDRZ large-v3 (released, step 850)** | **9.61%** | full ESB, 1000 samples (micro 5.88%) |
+| **WhisperDRZ large-v3 (released)** | **9.61%** | full ESB, 1000 samples (micro 5.88%) |
 
 So the full speaker-aware, event-aware, timing-aware model costs about **2 points of WER** over the base model (9.6% vs 7.4% macro) — a modest price for everything it adds, and on clean [LibriSpeech](https://www.openslr.org/12) the gap is much smaller. Some of getting that number down was *decoding* discipline rather than training — on an earlier, shakier checkpoint, tightening the inference guardrails and dropping a few pathological token classes took WER from ~18% to ~7%. (On the released model the guardrails matter much less — see the ablation above.)
 
 ### A note on these numbers
 
-Every headline number in this post — this ESB WER, the VoxConverse DER below, and the end-to-end timing figures — is measured on the **publicly released step-850 weights**, i.e. exactly the checkpoint you can download. Where two numbers exist for the same thing (e.g. best-case DTW timing vs. full-pipeline timing), both are given so the gap is visible rather than hidden.
+Every headline number in this post — this ESB WER, the VoxConverse DER below, and the end-to-end timing figures — is measured on the **publicly released weights**, i.e. exactly the checkpoint you can download. Where two numbers exist for the same thing (e.g. best-case DTW timing vs. full-pipeline timing), both are given so the gap is visible rather than hidden.
 
 It's also cheap to run: WhisperDRZ reaches ~92x real-time on a single GPU, which works out to roughly $0.01 per hour of audio on a commodity cloud GPU — about 36x cheaper than calling a hosted Whisper API, with diarization included rather than billed separately.
 
@@ -138,7 +142,7 @@ The digits *are* present in the training targets, so this reads as a data-propor
 | code | 25 | 52% | 48% | 64% | 80% |
 | **overall** | **267** | **23.6%** | **32.2%** | **34.8%** | **59.9%** |
 
-*format-exact* = the expected written string appears in the output (ignoring spacing/case); *digit-recall* = the expected digit sequence appears, any format. WhisperDRZ = released step-850 checkpoint.
+*format-exact* = the expected written string appears in the output (ignoring spacing/case); *digit-recall* = the expected digit sequence appears, any format. WhisperDRZ = released checkpoint.
 
 </details>
 
@@ -196,7 +200,7 @@ A big caveat on the worst numbers, though: **much of the broken tail is a decodi
 And per-language work is the deeper point. WhisperDRZ's real inference path applies a [VirtualMask](#inference-guardrails-a-virtual-mask) whose rules — where timing tokens may appear, how brackets and speaker digits nest — were shaped around English and WhisperDRZ's training format. I tested what happens when you point those rules at another language, and the result is emphatic: running these broken-tail languages through the *full production pipeline* (guardrails on) made them **dramatically worse**, not better — Korean went from 68% to **466%** WER, Amharic from 284% to 420%, Serbian from 88% to 359%. Forcing WhisperDRZ's English timing-and-format token patterns onto a language it was never trained to format derails decoding into runaway insertion. So the guardrails actively *hurt* non-English, and the plain-greedy numbers in the table above are the *better* view of what the weights actually know. So the honest read of this table isn't a clean capability ranking — it's a lower bound that conflates the weights' actual multilingual knowledge with the absence (and, in production, the English-centricity) of decoding rules. Getting trustworthy multilingual numbers would mean building per-language decoding constraints and re-measuring. One more reason it's a lower bound: this is clean read speech with the language handed to the model; real conversational, diarized audio is harder still.
 
 <details>
-<summary>All 83 languages (WhisperDRZ 850, forced-language, sorted)</summary>
+<summary>All 83 languages (WhisperDRZ v1, forced-language, sorted)</summary>
 
 | Language | Metric | Error |
 |---|---|---|
@@ -290,9 +294,9 @@ So the honest claim is narrower than "WhisperDRZ retains all of Whisper's langua
 
 ## What I'd do next
 
-**Move to audio codecs.** It was obvious from the start that the right substrate for this is a discrete audio codec, not 16 kHz mel features — and ideally a **low-frame-rate** one, **sub-12.5 Hz** (where both Kyutai's [Mimi](https://github.com/kyutai-labs/moshi) and our own [vui](https://github.com/fluxions-ai/vui) codec sit), so each token covers more time, sequences stay short, context stretches to hours at low latency, and event detection gets higher-fidelity. Training a codec and a model on top of it was simply out of budget and bandwidth for one person, and would have meant sourcing a huge from-scratch dataset. But it's the clear path forward — and the substrate that makes everything below, streaming especially, tractable.
+**Move to audio codecs.** It was obvious from the start that the right substrate for this is a discrete audio codec, not 16 kHz mel features at 50 Hz — and ideally a **low-frame-rate** one, **sub-12.5 Hz** (where Kyutai's [Mimi](https://github.com/kyutai-labs/moshi) sits), so each token covers more time, sequences stay short, context stretches to hours at low latency, and event detection gets higher fidelity. Training a codec and a model on top of it was simply out of budget and bandwidth for one person, and would have meant sourcing a huge from-scratch dataset. But it's the clear path forward — and the substrate that makes everything below, streaming especially, tractable.
 
-**In-context speaker ID.** With long context you can do what I showed working in [nanodrz](https://github.com/mogwai/nanodrz): prompt each new chunk with a few labelled chunks from earlier in the same recording, so the model carries speaker identity forward *in context*. That throws away the whole flawed embedding-and-clustering pipeline and makes streaming natural. The budget is realistic on a low-Hz codec: getting to ~12 minutes of context (only ~9k tokens at 12.5 Hz, fewer below that) is enough to carry a decent number of speakers forward from the previous inference chunk — they arrive **pre-identified**, so each new chunk just has to *match* against labelled exemplars rather than re-cluster from scratch. (Recent systems like [VibeVoice-ASR](https://github.com/microsoft/VibeVoice) point in a similar direction.)
+**In-context speaker ID.** With a longer context you could do what I showed work in [nanodrz](https://github.com/mogwai/nanodrz): prompt each new chunk with a few labelled chunks from earlier in the same recording, so the model carries speaker identity forward *in context*. That throws away the whole flawed embedding-and-clustering pipeline and makes streaming natural. The budget is realistic on a low-Hz codec: getting to ~12 minutes of context (only ~9k tokens at 12.5 Hz, fewer below that) is enough to carry a decent number of speakers forward from the previous inference chunk — they arrive **pre-identified**, so each new chunk just has to *match* against labelled exemplars rather than re-cluster from scratch. (Recent systems like [VibeVoice-ASR](https://github.com/microsoft/VibeVoice) point in a similar direction.)
 
 **Towards true streaming.** Everything here is chunked and offline — 30s windows, then external clustering stitched on top. On the low-Hz codec above, a genuinely streaming WhisperDRZ just needs a way to emit text *as the audio streams in*, via one of two routes:
 
@@ -309,7 +313,9 @@ So the honest claim is narrower than "WhisperDRZ retains all of Whisper's langua
 
 Each line says "speaker N is talking from t to t," nothing more. Two things make this appealing. First, it lets the model learn diarization as a first-class task rather than a side effect of transcription, which might finally give it a speaker representation good enough to replace the clustering hack. Second, because it never decodes words, it could double as a very fast standalone speaker-ID model — answer "are these two segments the same person?" directly, without paying for transcription. That's exactly the capability the failed embedding head was reaching for, approached as a decoding task instead of an auxiliary head.
 
-**Scale matters for this task.** I tried the same fine-tuning recipe on smaller Whisper bases and the results were poor. Doing diarization *and* transcription well seems to need 1B+ parameters — the smaller models just don't have the headroom to track speakers and words at once.
+**Scale matters for this task.** I tried the same fine-tuning recipe on smaller Whisper bases and the results were poor. Doing diarization *and* transcription well seems to need 1B+ parameters — the smaller models just don't have the headroom to track speakers and words at once. In fact it may be the case that > 1B is needed to do all these things.
+
+**Emotions.** We started work on emotions and there are some preliminary interesting results. More data is needed to see whether this works; it will be part of the next version.
 
 ## Closing
 
