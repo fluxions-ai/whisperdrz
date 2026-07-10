@@ -23,7 +23,6 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-flash = ["flash-attn", "triton"]
 demo = ["gradio"]
 eval = ["jiwer", "whisper-normalizer", "meeteval"]
 

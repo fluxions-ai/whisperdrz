@@ -8,6 +8,9 @@ chunking and stitching internally.
 This repository is inference only. Weights are distributed on the Hugging Face
 Hub at [`fluxions/whisperdrz`](https://huggingface.co/fluxions/whisperdrz).
 
+🎙️ **Try it in the browser** — no install needed:
+**[fluxions.ai/transcribe](https://fluxions.ai/transcribe)**.
+
 📖 **Full write-up** — how it works, the timing-token and diarization approach,
 honest results (WER, DER, timing, events, multilingual), and what didn't work:
 **[writeup.md](writeup.md)**.
@@ -15,22 +18,16 @@ honest results (WER, DER, timing, events, multilingual), and what didn't work:
 ## Install
 
 ```bash
-pip install whisperdrz
-# optional extras:
-pip install "whisperdrz[flash]"   # Flash Attention — much faster decoding on CUDA
-pip install "whisperdrz[demo]"    # the gradio demo
-pip install "whisperdrz[eval]"    # WER/WDER metrics (jiwer, whisper-normalizer)
+pip install -e .            # add ".[demo]" for the gradio demo, ".[eval]" for the metrics
 ```
 
-Or from a clone of this repository (editable install):
+Requires Python 3.12+ and FFmpeg (for audio decoding: `apt install ffmpeg` /
+`brew install ffmpeg`). Runs on a CUDA GPU or on CPU.
 
-```bash
-pip install -e .            # add ".[flash]", ".[demo]", or ".[eval]" for extras
-```
-
-Requires Python 3.12+. Runs on a CUDA GPU or on CPU. Flash Attention is
-optional: when it (and a CUDA GPU) is available it is used with CUDA graphs for
-fast decoding; otherwise a pure-torch attention path is used automatically.
+Flash Attention is optional: when `flash-attn` is installed (and a CUDA GPU is
+available) it is used with CUDA graphs for fast decoding; otherwise a pure-torch
+attention path is used automatically. flash-attn needs torch present at build
+time, so install it separately: `pip install flash-attn --no-build-isolation`.
 
 ## Command line
 
