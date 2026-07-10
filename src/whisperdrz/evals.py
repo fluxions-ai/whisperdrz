@@ -1,14 +1,19 @@
-"""Evaluation metrics for WhisperDRZ transcripts: WER and WDER.
+"""Evaluation metrics for WhisperDRZ transcripts: WER, WDER and cpWER.
 
 - WER (word error rate): Levenshtein word distance after normalization.
 - WDER (word diarization error rate): of the words that align between
   reference and hypothesis, the fraction assigned to the wrong speaker
   (under the best speaker permutation). Insertions/deletions are WER errors
   and don't count toward WDER.
+- cpWER (concatenated minimum-permutation WER): concatenate each speaker's
+  words into one stream, pick the speaker permutation that minimises the total
+  word errors, then report a single WER over the concatenated streams. Unlike
+  WDER it *does* charge insertions/deletions, so it jointly scores transcription
+  and diarization. Computed with meeteval.
 
-Both operate on WhisperDRZ-format text (speaker tags ``[N]``, ``<|t|>`` timestamps,
+All operate on WhisperDRZ-format text (speaker tags ``[N]``, ``<|t|>`` timestamps,
 ``[tag]`` non-speech events). Requires the ``eval`` extra (jiwer,
-whisper-normalizer): ``pip install -e ".[eval]"``.
+whisper-normalizer, meeteval): ``pip install -e ".[eval]"``.
 """
 
 import re
@@ -113,6 +118,63 @@ def words_with_speakers(text: str) -> list[tuple[str, str]]:
             if word and _WORD_OK.match(word):
                 out.append((word, speaker))
     return out
+
+
+def speaker_streams(text: str) -> dict[str, str]:
+    """Group a transcript into one whisper-normalized word stream per speaker.
+
+    Each ``[N]`` line's words are appended to that speaker's stream (in order),
+    then the whole stream is run through :func:`clean_for_wer`. This is the input
+    shape cpWER needs: ``{speaker_label: "normalized words ..."}``.
+    """
+    streams: dict[str, list[str]] = {}
+    speaker = "0"
+    for line in text.split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        m = _SPEAKER_LINE.match(line)
+        if m:
+            speaker = m.group(1)
+            line = line[m.end() :]
+        streams.setdefault(speaker, []).append(line)
+    return {spk: clean_for_wer(" ".join(parts)) for spk, parts in streams.items()}
+
+
+def calculate_cpwer(ref_text: str, hyp_text: str) -> dict:
+    """Concatenated minimum-permutation WER (cpWER) via meeteval.
+
+    Concatenates each speaker's words, finds the speaker assignment minimising
+    total errors, and returns a single WER over the concatenated streams plus
+    the raw error counts (for a corpus micro-average) and the chosen assignment.
+    """
+    from meeteval.wer import cp_word_error_rate
+
+    ref = {k: v for k, v in speaker_streams(ref_text).items() if v}
+    hyp = {k: v for k, v in speaker_streams(hyp_text).items() if v}
+    if not ref:
+        return {
+            "cpwer": 0.0,
+            "errors": 0,
+            "insertions": 0,
+            "deletions": 0,
+            "substitutions": 0,
+            "reference_words": 0,
+            "assignment": (),
+        }
+    if not hyp:
+        hyp = {"0": ""}
+
+    er = cp_word_error_rate(ref, hyp)
+    return {
+        "cpwer": er.error_rate if er.error_rate is not None else 0.0,
+        "errors": er.errors,
+        "insertions": er.insertions,
+        "deletions": er.deletions,
+        "substitutions": er.substitutions,
+        "reference_words": er.length,
+        "assignment": er.assignment,
+    }
 
 
 def calculate_wder(ref_text: str, hyp_text: str) -> dict:

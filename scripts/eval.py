@@ -1,12 +1,12 @@
-"""Run WhisperDRZ over a manifest and report WER and WDER.
+"""Run WhisperDRZ over a manifest and report WER, WDER and cpWER.
 
 Manifest is JSON Lines, one object per utterance:
 
     {"audio": "path/to/a.wav", "text": "[0] hello there [1] hi"}
     {"audio": "path/to/b.wav", "text": "the quick brown fox"}
 
-`text` is the reference transcript. Speaker tags `[N]` are optional; WDER is
-only computed over utterances whose reference has more than one speaker.
+`text` is the reference transcript. Speaker tags `[N]` are optional; WDER and
+cpWER are only computed over utterances whose reference has more than one speaker.
 
 Usage:
     pip install -e ".[eval]"
@@ -18,7 +18,12 @@ import json
 
 from whisperdrz import load_model
 from whisperdrz.audio import SAMPLE_RATE, load_audio
-from whisperdrz.evals import calculate_wder, calculate_wer, has_speakers
+from whisperdrz.evals import (
+    calculate_cpwer,
+    calculate_wder,
+    calculate_wer,
+    has_speakers,
+)
 
 
 def _read_manifest(path: str) -> list[dict]:
@@ -48,8 +53,10 @@ def main(argv: list[str] | None = None) -> int:
 
     total_ref_words = total_wer_errors = 0
     total_aligned = total_wder_wrong = 0
+    total_cp_words = total_cp_errors = 0
     wer_list: list[float] = []
     wder_list: list[float] = []
+    cpwer_list: list[float] = []
     results = []
 
     for i, item in enumerate(items):
@@ -70,6 +77,12 @@ def main(argv: list[str] | None = None) -> int:
             total_wder_wrong += d["aligned"] - d["correct"]
             wder_list.append(d["wder"])
             row["wder"] = d["wder"]
+
+            c = calculate_cpwer(ref, hyp)
+            total_cp_words += c["reference_words"]
+            total_cp_errors += c["errors"]
+            cpwer_list.append(c["cpwer"])
+            row["cpwer"] = c["cpwer"]
         results.append(row)
 
         if (i + 1) % 50 == 0:
@@ -87,8 +100,12 @@ def main(argv: list[str] | None = None) -> int:
         macro_wder = sum(wder_list) / len(wder_list)
         print(f"WDER (micro):   {micro_wder * 100:.2f}%  ({len(wder_list)} multi-speaker)")
         print(f"WDER (macro):   {macro_wder * 100:.2f}%")
+        micro_cpwer = total_cp_errors / max(total_cp_words, 1)
+        macro_cpwer = sum(cpwer_list) / len(cpwer_list)
+        print(f"cpWER (micro):  {micro_cpwer * 100:.2f}%  ({len(cpwer_list)} multi-speaker)")
+        print(f"cpWER (macro):  {macro_cpwer * 100:.2f}%")
     else:
-        print("WDER:           n/a (no multi-speaker references)")
+        print("WDER/cpWER:     n/a (no multi-speaker references)")
 
     if args.save:
         with open(args.save, "w") as f:

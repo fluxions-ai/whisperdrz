@@ -25,7 +25,7 @@ dependencies = [
 [project.optional-dependencies]
 flash = ["flash-attn", "triton"]
 demo = ["gradio"]
-eval = ["jiwer", "whisper-normalizer"]
+eval = ["jiwer", "whisper-normalizer", "meeteval"]
 
 [project.scripts]
 whisperdrz = "whisperdrz.cli:main"
