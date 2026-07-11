@@ -165,6 +165,19 @@ tooling used for the benchmarks above.
 python demo/app.py --model whisperdrz-large-v3.safetensors
 ```
 
+## Citation
+
+```
+@software{whisperdrz_2026,
+  author = {Coultas Blum, Harry},
+  month = {07},
+  title = {{WhisperDRZ}},
+  url = {https://github.com/fluxions-ai/whisperdrz},
+  version = {0.1.0},
+  year = {2026}
+}
+```
+
 ## License
 
 MIT. See [LICENSE](LICENSE).
