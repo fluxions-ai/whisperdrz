@@ -7,7 +7,7 @@ from whisperdrz.audio import SAMPLE_RATE, load_audio
 
 
 def _load_mono_16k(path: str):
-    audio, sr = load_audio(path, sample_rate=SAMPLE_RATE)
+    audio, _ = load_audio(path, sample_rate=SAMPLE_RATE)
     if audio.dim() > 1:
         audio = audio.mean(dim=0)
     return audio

@@ -20,10 +20,10 @@ median start/end error on a 150-sample benchmark — about 5x the decoder's own
 """
 
 import base64
+from concurrent.futures import ThreadPoolExecutor
 import gzip
 import os
 import re
-from concurrent.futures import ThreadPoolExecutor
 
 import numba
 import numpy as np
@@ -42,6 +42,7 @@ from whisperdrz.audio import (
     TOKENS_PER_SECOND,
     LogMelSpectrogram,
 )
+from whisperdrz.clean import TIMINGS_FORMAT
 
 # Whisper large-v3 alignment heads (32 layers x 20 heads, 10 selected).
 # WhisperDRZ is fine-tuned from large-v3 so the heads transfer.
@@ -285,9 +286,7 @@ def tokens_chars(
 
 # ---------- Predicted-text parsing ----------
 
-_TS_RE = re.compile(r"<\|(\d+\.\d+)\|>")
 _TOKEN_RE = re.compile(r"<\|\d+\.\d+\|>|[^\s<]+")
-_STRIP_SPEAKER = re.compile(r"^\[(?:\d+|c)\]\s*", flags=re.MULTILINE)
 _STRIP_BRACKET_TAG = re.compile(r"\[/?[a-zA-Z]+\]")
 _STRIP_META = re.compile(r"<(?!\|)[^>]*>")
 _STRIP_CHOP = re.compile(r"\[CHOP\]")
@@ -317,18 +316,18 @@ def _extract_line_words_and_tag_anchors(
     words: list[tuple[str, float | None, float | None]] = []
     tag_anchors: list[tuple[float, float, int | None, int | None]] = []
     for i, (tok, ts, te) in enumerate(items):
-        if _TS_RE.fullmatch(tok):
+        if TIMINGS_FORMAT.fullmatch(tok):
             continue
         # Check left and right adjacent timestamps (no whitespace gap).
         left_t = right_t = None
         if i > 0:
             prev_tok, _, prev_end = items[i - 1]
-            m = _TS_RE.fullmatch(prev_tok)
+            m = TIMINGS_FORMAT.fullmatch(prev_tok)
             if m is not None and prev_end == ts:
                 left_t = float(m.group(1))
         if i + 1 < len(items):
             next_tok, next_start, _ = items[i + 1]
-            m = _TS_RE.fullmatch(next_tok)
+            m = TIMINGS_FORMAT.fullmatch(next_tok)
             if m is not None and next_start == te:
                 right_t = float(m.group(1))
 

@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import base64
-import gzip
 import os
 from collections.abc import Iterable
 
@@ -95,9 +93,6 @@ def flash_attn_with_kvcache(q, *args, **kwargs):
     if HAS_FLASH_ATTN and q.is_cuda:
         return _flash_impl(q, *args, **kwargs)
     return _sdpa_attn_with_kvcache(q, *args, **kwargs)
-
-# Sequence length buckets for compiled decode
-BUCKETS = [32, 64, 128, 256, 448]
 
 
 class FlashKVCache(nn.Module):
@@ -685,15 +680,6 @@ class WhisperDRZ(nn.Module):
             timestamp_begin=timestamp_begin,
         )
 
-        # use the last half among the decoder layers for time alignment by default;
-        # to use a specific set of heads, see `set_alignment_heads()` below.
-        all_heads = torch.zeros(
-            self.dims.n_text_layer, self.dims.n_text_head, dtype=torch.bool
-        )
-        all_heads[self.dims.n_text_layer // 2 :] = True
-        # self.register_buffer("alignment_heads", all_heads, persistent=False)
-        # self.set_alignment_heads(_ALIGNMENT_HEADS[config.base])
-
         # Pre-computed cu_seq_cross for varlen attention (lazily sized)
         self._cu_cross_buf: Tensor | None = None
 
@@ -705,16 +691,6 @@ class WhisperDRZ(nn.Module):
                 embedding_dim=config.speaker_embedding_dim,
                 num_layers=config.speaker_head_layers,
             )
-
-    def set_alignment_heads(self, dump: bytes):
-        array = np.frombuffer(
-            gzip.decompress(base64.b85decode(dump)), dtype=bool
-        ).copy()
-        mask = torch.from_numpy(array).reshape(
-            self.dims.n_text_layer, self.dims.n_text_head
-        )
-        self.register_buffer("alignment_heads", mask, persistent=False)
-
 
     @property
     def device(self):

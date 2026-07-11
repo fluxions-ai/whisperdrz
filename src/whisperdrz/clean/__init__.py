@@ -2,8 +2,7 @@
 
 from .patterns import (
     BRACKET_DIGIT_MATCH,
-    NONSPEECH,
-    TIMESTAMP_VALIDATION_PATTERN,
+    SPEAKER_LINE_START,
     TIMINGS_FORMAT,
 )
 from .speakers import (
@@ -29,8 +28,7 @@ from .timings import (
 
 __all__ = [
     "BRACKET_DIGIT_MATCH",
-    "NONSPEECH",
-    "TIMESTAMP_VALIDATION_PATTERN",
+    "SPEAKER_LINE_START",
     "TIMINGS_FORMAT",
     "consolidate_adjacent_tags",
     "cut_after_last_timed_word",

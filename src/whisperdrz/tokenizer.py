@@ -4,7 +4,6 @@ from dataclasses import dataclass, field
 from functools import cache, cached_property
 
 import tiktoken
-import torch
 from torch import Tensor
 
 LANGUAGES = {
@@ -165,9 +164,6 @@ class Tokenizer:
     def encode(self, text, **kwargs):
         return self.encoding.encode(text, allowed_special="all", **kwargs)
 
-    def encode_tensor(self, text, **kwargs):
-        return torch.tensor(self.encoding.encode(text, allowed_special="all", **kwargs))
-
     def decode(self, token_ids: list[int] | Tensor, **kwargs) -> str:
         # NOTE(james) filter out timestamp tokens when deciding how to present to the end user etc
         # token_ids = [t for t in token_ids if t < self.timestamp_begin]
@@ -264,15 +260,6 @@ class Tokenizer:
         for token_id in tokens:
             decoded = self.decode([token_id])
             print(f"  {token_id:6d} -> {decoded!r}")
-
-
-CONDITIONING_TOKENS = (
-    "<|nodiarize|>",
-    "<|speech|>",
-    "<|emotion|>",
-    "<|nonspeech|>",
-    "<|accent|>",
-)
 
 
 @cache

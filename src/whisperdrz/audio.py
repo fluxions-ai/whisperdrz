@@ -13,7 +13,6 @@ def exact_div(x, y):
 
 # hard-coded audio hyperparameters
 SAMPLE_RATE = 16000
-SR = SAMPLE_RATE
 N_FFT = 400
 HOP_LENGTH = 160
 CHUNK_LENGTH = 30

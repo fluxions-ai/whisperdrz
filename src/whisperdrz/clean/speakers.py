@@ -10,6 +10,7 @@ This module handles:
 import re
 
 from .patterns import (
+    SPEAKER_LINE_START,
     SPEAKER_TAGS_GENERAL,
 )
 
@@ -38,9 +39,6 @@ def remove_speaker_tags_not_after_newline(text):
     return SPEAKER_TAGS_GENERAL.sub("", text)
 
 
-_SPEAKER_PREFIX = re.compile(r"^\[(\d+|c)\]\s*")
-
-
 def merge_consecutive_speakers(text: str) -> str:
     """Merge consecutive lines from the same speaker, skipping blank lines."""
     chunks = text.split("[CHOP]")
@@ -51,9 +49,9 @@ def merge_consecutive_speakers(text: str) -> str:
         for line in lines:
             if not line.strip():
                 continue
-            m = _SPEAKER_PREFIX.match(line)
+            m = SPEAKER_LINE_START.match(line)
             if m and merged:
-                prev_m = _SPEAKER_PREFIX.match(merged[-1])
+                prev_m = SPEAKER_LINE_START.match(merged[-1])
                 if prev_m and prev_m.group(1) == m.group(1):
                     merged[-1] = merged[-1].rstrip() + " " + line[m.end() :]
                     continue

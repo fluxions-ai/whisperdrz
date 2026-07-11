@@ -16,7 +16,6 @@ from .patterns import (
     _DIGIT_PATTERN,
     _FLOAT_PATTERN,
     _TIMING_CORE,
-    QUANTIZE_TIMESTAMP_PATTERN,
     SCORED_TIMING_PATTERN,
     TIMINGS_FORMAT,
 )
@@ -107,7 +106,7 @@ def quantize_timestamps(text: str, offset: float = 0.0, step: float = 0.02):
     def repl(match):
         return quantize_timestamp(match, step, offset=offset)
 
-    return QUANTIZE_TIMESTAMP_PATTERN.sub(repl, text)
+    return TIMINGS_FORMAT.sub(repl, text)
 
 
 def offset_timestamps(text: str, offset: float) -> str:
@@ -127,7 +126,7 @@ def offset_timestamps(text: str, offset: float) -> str:
         new_time = round_to(new_time, 0.02)
         return f"<|{new_time:.2f}|>"
 
-    return QUANTIZE_TIMESTAMP_PATTERN.sub(repl, text)
+    return TIMINGS_FORMAT.sub(repl, text)
 
 
 def remove_invalid_timing_pairs(text: str, min_duration: float = 0.02) -> str:

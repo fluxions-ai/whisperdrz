@@ -18,7 +18,6 @@ import torch
 def cluster_speakers(
     embeddings: list[tuple[int, int, torch.Tensor]],
     threshold: float = 0.6,
-    method: str = "centroid",
     min_cluster_size: int = 1,
 ) -> dict[tuple[int, int], int]:
     """Cluster speaker embeddings using GPU-accelerated agglomerative clustering.
@@ -33,7 +32,6 @@ def cluster_speakers(
             Embeddings should be L2-normalized tensors.
         threshold: Distance threshold for cutting dendrogram. Lower = more clusters.
             Recommended range: 0.2-0.5 for speaker embeddings.
-        method: Linkage method - only "centroid" supported for GPU version
         min_cluster_size: Minimum cluster size. Smaller clusters get reassigned
             to the nearest large cluster centroid.
 

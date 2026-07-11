@@ -45,7 +45,6 @@ class BucketedCUDAGraphs:
         model,
         self_kv: list,
         cross_kv: list,
-        max_batch_size: int = 52,
         return_hidden_states: bool = False,
     ):
         self.model = model
@@ -175,6 +174,7 @@ class BucketedCUDAGraphs:
 
 
 from whisperdrz.clean import (
+    SPEAKER_LINE_START,
     TIMINGS_FORMAT,
     consolidate_adjacent_tags,
     fix_nonmonotonic_timestamps,
@@ -189,8 +189,6 @@ from whisperdrz.clean import (
 )
 from whisperdrz.decoding import DecoderState, decode_batch, update_state_after_decode
 
-SPEAKER_LINE_RE = re.compile(r"^\[(\d+|c)\]\s*")
-_TIMING_RE = re.compile(r"<\|(\d+\.\d+)\|>")
 
 
 def _strip_to_last_closing(cur: str) -> str:
@@ -206,7 +204,7 @@ def _strip_to_last_closing(cur: str) -> str:
     """
     lines = cur.split("\n")
     for i in range(len(lines) - 1, -1, -1):
-        ts = list(_TIMING_RE.finditer(lines[i]))
+        ts = list(TIMINGS_FORMAT.finditer(lines[i]))
         if not ts:
             continue
         if len(ts) % 2 == 0:
@@ -244,7 +242,7 @@ def parse_to_segments(text: str) -> list[dict]:
             continue
 
         speaker: int | str = 0
-        speaker_match = SPEAKER_LINE_RE.match(line)
+        speaker_match = SPEAKER_LINE_START.match(line)
         if speaker_match:
             spk = speaker_match.group(1)
             speaker = spk if spk == "c" else int(spk)
@@ -425,7 +423,7 @@ def remap_speakers_per_line(
         if not stripped or stripped.startswith("[CHOP]"):
             result_lines.append(line)
             continue
-        m = SPEAKER_LINE_RE.match(stripped)
+        m = SPEAKER_LINE_START.match(stripped)
         if not m:
             result_lines.append(line)
             continue
@@ -529,7 +527,6 @@ class Transcriber:
         top_k=None,
         top_p=None,
         force_timing_every_word=False,
-        force_fixed_segments=False,
         skip_non_english=False,
         precomputed_mels=False,
         allow_tags=False,
@@ -611,7 +608,7 @@ class Transcriber:
                 index=i,
                 tokens=self.init_tensor.clone(),
                 initial_tokens=self.init_tensor.clone(),
-                langauge=lang,
+                language=lang,
                 force_timing_every_word=force_timing_every_word,
             )
             for i in range(self.n_slots)
@@ -721,7 +718,6 @@ class Transcriber:
             self.model,
             self.self_kv,
             self.cross_kv,
-            max_batch_size=self.BS,
             return_hidden_states=False,
         )
         # CUDA graphs only help (and only work) on CUDA with flash attention.
@@ -945,14 +941,14 @@ class Transcriber:
             if k not in ["id", "audio", "mel"]:
                 s.meta[k] = chunk[k]
 
-        # Per-chunk lang override: build init_tokens + set state.langauge.
+        # Per-chunk lang override: build init_tokens + set state.language.
         # Falls back to the Transcriber's global lang when chunk doesn't specify one.
         chunk_lang = chunk.get("lang")
         if chunk_lang is not None:
             slot_init_tokens = self._build_init_tokens(chunk_lang)
             slot_init_tensor = torch.tensor(slot_init_tokens, device=self.device)
             slot_init_len = len(slot_init_tokens)
-            s.langauge = chunk_lang
+            s.language = chunk_lang
             effective_lang = chunk_lang
         else:
             slot_init_tokens = self.init_tokens
@@ -1156,16 +1152,16 @@ class Transcriber:
         if (
             self.skip_non_english
             and self.detect_language
-            and hasattr(s, "langauge")
-            and s.langauge
+            and hasattr(s, "language")
+            and s.language
             and s.token_count >= 2
         ):
-            if s.langauge != "en":
+            if s.language != "en":
                 ret = s.meta.copy()
                 ret["id"] = s.id
                 ret["prediction"] = ""
-                ret["language"] = s.langauge
-                ret["stop_reason"] = f"non_english:{s.langauge}"
+                ret["language"] = s.language
+                ret["stop_reason"] = f"non_english:{s.language}"
                 s.status = "ready"
                 return {"skip": True, "result": ret, "state": s}
 
@@ -1403,7 +1399,7 @@ class Transcriber:
 
             s.meta["prediction"] = cleaned
             s.meta["raw_cur"] = s.sofar  # Raw output before cleaning
-            s.meta["language"] = getattr(s, "langauge", "unknown")
+            s.meta["language"] = getattr(s, "language", "unknown")
             if not s.stop_reason:
                 s.stop_reason = "completed"
             s.meta["stop_reason"] = s.stop_reason
@@ -1723,13 +1719,13 @@ class Transcriber:
                         if (
                             self.skip_non_english
                             and self.detect_language
-                            and hasattr(s, "langauge")
-                            and s.langauge
-                            and s.langauge != "en"
+                            and hasattr(s, "language")
+                            and s.language
+                            and s.language != "en"
                             and s.status not in ("finished", "ready")
                         ):
                             s.status = "finished"
-                            s.stop_reason = f"skip_non_english:{s.langauge}"
+                            s.stop_reason = f"skip_non_english:{s.language}"
                             s.sofar = ""
                             s.cur = ""
 

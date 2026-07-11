@@ -362,7 +362,7 @@ class DecoderState:
         self._cpu_masks: dict[str, Tensor] = {}
 
         # Persistent per-slot base_blocked buffer. Shape [BS, V], updated in-place when
-        # a slot's `state.langauge` changes (set at slot init and at language-prediction
+        # a slot's `state.language` changes (set at slot init and at language-prediction
         # step — both infrequent). GPU-resident so the per-step clone is a fast D2D copy
         # and all downstream mask ops in decode_batch stay on GPU (no H2D per step).
         self._slot_base_buf_gpu: Tensor | None = None
@@ -639,7 +639,7 @@ class DecoderState:
             space_enabled[newline_token] = True
         cache["space_starting_enabled"] = space_enabled
 
-        # Pre-cached single token tensors (avoids repeated encode_tensor calls)
+        # Pre-cached single token tensors (avoids repeated encode calls)
         cache["token_tensors"] = {}
         for char in ["[", "]", "(", ")", "<", ">", " ", "0", "\n", "*"]:
             cache["token_tensors"][char] = torch.tensor(
@@ -759,7 +759,7 @@ class DecoderState:
     def update_slot_base_buffer(self, states) -> Tensor:
         """Return persistent [BS, V] per-slot base_blocked buffer on GPU, refreshed in-place.
 
-        Only rows whose `state.langauge` differs from the cached value get updated
+        Only rows whose `state.language` differs from the cached value get updated
         (rare: once at slot init, once at language prediction). Callers should
         `.clone()` before mutating since the buffer persists across steps.
         """
@@ -774,14 +774,14 @@ class DecoderState:
             self._slot_langs_cached = [None] * BS
             # Force refill of all rows
             for i, s in enumerate(states):
-                lang = getattr(s, "langauge", None)
+                lang = getattr(s, "language", None)
                 buf[i].copy_(self.get_base_blocked_cpu(lang).to(self.device))
                 self._slot_langs_cached[i] = lang
             return buf
 
         cached = self._slot_langs_cached
         for i, s in enumerate(states):
-            lang = getattr(s, "langauge", None)
+            lang = getattr(s, "language", None)
             if lang != cached[i]:
                 buf[i].copy_(self.get_base_blocked_cpu(lang).to(self.device))
                 cached[i] = lang
@@ -1774,7 +1774,7 @@ def decode_batch(
     for i in lang_indices:
         if results[i] is not None:
             text = results[i][0]
-            states[i].langauge = text.replace("<|", "").replace("|>", "")
+            states[i].language = text.replace("<|", "").replace("|>", "")
 
     # ==========================================================================
     # PHASE 4: Corrections (timing before newline/EOT, unclosed brackets, etc.)
@@ -2051,7 +2051,6 @@ def _sample_masked(
     blocked_mask: Tensor,
     temperature: float,
     ds: DecoderState,
-    repetition_penalty: float = 1.2,
 ) -> tuple[str, int]:
     """Sample from logits with blocked mask applied. Returns (text, token_id_int)."""
     NEGINF = float("-inf")
@@ -2156,7 +2155,3 @@ def _get_timing_range_cpu(
         cap = min(cap, max_timing)
     return _range(min_next, cap)
 
-
-# Backwards compatibility aliases
-decode_batch_gpu = decode_batch
-decode_batch_gpu_v2 = decode_batch
