@@ -822,7 +822,7 @@ class Transcriber:
             )
 
         merged = merge_consecutive_speakers(combined)
-        merged = fix_nonmonotonic_timestamps(merged)
+        merged = fix_nonmonotonic_timestamps(merged, max_time=len(audio) / 16000)
         text = normalize_speaker_ids(merged)
         return TranscribeResults(
             text=text,
@@ -1358,7 +1358,9 @@ class Transcriber:
             cleaned = remove_invalid_timing_pairs(cleaned)
             cleaned = remove_speaker_tags_not_after_newline(cleaned)
             cleaned = merge_consecutive_speakers(cleaned)
-            cleaned = fix_nonmonotonic_timestamps(cleaned)
+            # max_time: timestamps beyond the chunk's real audio length are
+            # impossible; drop them rather than letting them anchor the line.
+            cleaned = fix_nonmonotonic_timestamps(cleaned, max_time=s.duration)
             cleaned = re.sub(r'\s*\["\s*(?=\n|$)', "", cleaned)
             cleaned = re.sub(r"\s+[01]\s*(?=\n|$)", "", cleaned)
             cleaned = re.sub(r"(?<=\n)]|^]", "", cleaned)

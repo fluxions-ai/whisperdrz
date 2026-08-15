@@ -17,6 +17,7 @@ from .patterns import (
     _FLOAT_PATTERN,
     _TIMING_CORE,
     SCORED_TIMING_PATTERN,
+    TIMESTAMP_WORD,
     TIMINGS_FORMAT,
 )
 
@@ -196,38 +197,106 @@ def remove_invalid_timing_pairs(text: str, min_duration: float = 0.02) -> str:
     return text
 
 
-def fix_nonmonotonic_timestamps(text: str) -> str:
-    """Fix backwards timestamps within each line.
+def _line_timing_units(line: str) -> list[tuple[float, float, list[tuple[int, int]]]]:
+    """Group a line's timestamps into droppable units.
 
-    Within a single line, timestamps must be monotonically non-decreasing.
-    If a timestamp goes backwards, clamp it to the previous value + 0.02s.
+    A unit is a `<|s|>word<|e|>` pair (both timestamps drop together, keeping
+    the word) or a lone timestamp. Returns (t_first, t_last, spans) per unit,
+    where spans are the character ranges of just the timestamp tokens.
+    """
+    units: list[tuple[float, float, list[tuple[int, int]]]] = []
+    covered: list[tuple[int, int]] = []
+    for m in TIMESTAMP_WORD.finditer(line):
+        t0, t1 = float(m.group(1)), float(m.group(3))
+        ts0_end = m.start() + len(m.group(1)) + 4  # <| ... |>
+        ts1_start = m.end() - (len(m.group(3)) + 4)
+        units.append((t0, t1, [(m.start(), ts0_end), (ts1_start, m.end())]))
+        covered.append((m.start(), m.end()))
+    for m in TIMINGS_FORMAT.finditer(line):
+        if any(s <= m.start() < e for s, e in covered):
+            continue
+        t = float(m.group(1))
+        units.append((t, t, [(m.start(), m.end())]))
+    units.sort(key=lambda u: u[2][0][0])
+    return units
 
-    Examples:
-        "<|26.68|>I'm<|26.78|> <|26.08|>doing.<|27.08|>"
-        -> "<|26.68|>I'm<|26.78|> <|26.80|>doing.<|27.08|>"
+
+def fix_nonmonotonic_timestamps(text: str, max_time: float | None = None) -> str:
+    """Make each line's timestamps monotonic by DROPPING outlier timing units.
+
+    The old behaviour clamped a backwards timestamp to the previous value
+    + 0.02s — so a single hallucinated far-forward timestamp poisoned every
+    later (correct, lower) timestamp on the line, flattening whole lines into
+    0.02s staircases. Instead, keep the longest non-decreasing chain of timing
+    units and strip the rest; their words simply become untimed, which is
+    valid WhisperDRZ format.
+
+    max_time: when given (the audio length of the window), units starting
+    beyond it are dropped outright — they can't be real no matter how
+    internally consistent they look.
+
+    Example (the backwards unit is dropped, its neighbours keep their times):
+        "<|26.68|>I'm<|26.78|> <|26.08|>doing.<|27.08|> <|27.08|>ok<|27.30|>"
+        -> "<|26.68|>I'm<|26.78|> doing. <|27.08|>ok<|27.30|>"
     """
     result_lines = []
     for line in text.split("\n"):
-        matches = list(TIMINGS_FORMAT.finditer(line))
-        if len(matches) < 2:
+        units = _line_timing_units(line)
+        if not units:
             result_lines.append(line)
             continue
 
-        last_t = float(matches[0].group(1))
-        replacements = []
-        for m in matches[1:]:
-            t = float(m.group(1))
-            if t < last_t:
-                new_t = last_t + 0.02
-                replacements.append((m.start(), m.end(), f"<|{new_t:.2f}|>"))
-                last_t = new_t
+        candidates = []  # indices eligible for the monotonic chain
+        forced_drop = set()
+        for i, (t0, t1, _spans) in enumerate(units):
+            if (
+                t1 < t0 - 0.001  # internally backwards pair
+                or (max_time is not None and t0 > max_time + 0.02)
+                # 0.5s slack: a word straddling the chunk boundary may
+                # legitimately end slightly past the audio; a far-out end is bogus.
+                or (max_time is not None and t1 > max_time + 0.5)
+            ):
+                forced_drop.add(i)
             else:
-                last_t = t
+                candidates.append(i)
 
-        if replacements:
-            for start, end, repl in reversed(replacements):
-                line = line[:start] + repl + line[end:]
+        # Longest non-decreasing chain over candidate units (O(n^2), n small).
+        # Tie-break on smaller ending time so impossible late tails lose.
+        best_len = [0] * len(units)
+        best_prev = [-1] * len(units)
+        for ci, i in enumerate(candidates):
+            best_len[i] = 1
+            for j in candidates[:ci]:
+                if units[i][0] >= units[j][1] - 0.001 and (
+                    best_len[j] + 1 > best_len[i]
+                    or (
+                        best_len[j] + 1 == best_len[i]
+                        and best_prev[i] != -1
+                        and units[j][1] < units[best_prev[i]][1]
+                    )
+                ):
+                    best_len[i] = best_len[j] + 1
+                    best_prev[i] = j
+        keep: set[int] = set()
+        if candidates:
+            end = max(
+                candidates,
+                key=lambda i: (best_len[i], -units[i][1]),
+            )
+            while end != -1:
+                keep.add(end)
+                end = best_prev[end]
 
+        drops = [i for i in range(len(units)) if i not in keep]
+        if not drops:
+            result_lines.append(line)
+            continue
+        spans_to_remove = sorted(
+            (span for i in drops for span in units[i][2]), reverse=True
+        )
+        for s, e in spans_to_remove:
+            line = line[:s] + line[e:]
+        line = re.sub(r" {2,}", " ", line).rstrip()
         result_lines.append(line)
     return "\n".join(result_lines)
 
