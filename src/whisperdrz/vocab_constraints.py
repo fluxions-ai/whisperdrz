@@ -98,6 +98,8 @@ LANGUAGE_SCRIPT_COMPATIBILITY = {
             "mn",
             "uz",
             "tg",
+            "tt",
+            "ba",
         ],
         "allowed_scripts": [
             "LATIN",
@@ -113,13 +115,13 @@ LANGUAGE_SCRIPT_COMPATIBILITY = {
     },
     # Arabic script languages
     "arabic": {
-        "languages": ["ar", "fa", "ur", "ps"],
+        "languages": ["ar", "fa", "ur", "ps", "sd"],
         "allowed_scripts": ["LATIN", "ARABIC"],  # Latin for loanwords
         "allow_ascii_only": False,
     },
-    # Hebrew
+    # Hebrew script languages (Hebrew + Yiddish)
     "hebrew": {
-        "languages": ["he"],
+        "languages": ["he", "yi"],
         "allowed_scripts": ["LATIN", "HEBREW"],
         "allow_ascii_only": False,
     },
@@ -129,7 +131,8 @@ LANGUAGE_SCRIPT_COMPATIBILITY = {
         "allowed_scripts": ["LATIN", "CJK", "HIRAGANA", "KATAKANA", "HANGUL"],
         "allow_ascii_only": False,
     },
-    # Indian languages (Devanagari, Bengali, Tamil, etc.)
+    # Indian languages (Devanagari, Bengali, Tamil, etc.). Urdu is NOT here —
+    # it's Arabic-script and lives in the "arabic" group.
     "indic": {
         "languages": [
             "hi",
@@ -143,9 +146,9 @@ LANGUAGE_SCRIPT_COMPATIBILITY = {
             "pa",
             "or",
             "as",
-            "ur",
             "ne",
             "si",
+            "sa",
         ],
         "allowed_scripts": [
             "LATIN",
@@ -348,22 +351,35 @@ def get_blocked_tokens_for_language(language_code: str) -> tuple[int, ...]:
     return tuple(blocked_tokens)
 
 
-# UTF-8 lead-byte ranges that unambiguously start characters of a script.
-# Used to unblock byte-fragment tokens per language group (see
-# get_fragment_tokens_to_unblock). Only scripts whose characters commonly
-# lack complete vocab tokens need an entry.
-_SCRIPT_LEAD_BYTES = {
-    "CYRILLIC": (0xD0, 0xD4),  # U+0400-U+052F (Cyrillic + supplement)
+# UTF-8 byte ranges of each script's codepoint block, as (first_char, last_char)
+# encoded bytes. Used to unblock byte-fragment tokens per language group (see
+# get_fragment_tokens_to_unblock). Only scripts whose characters commonly lack
+# complete vocab tokens need an entry. A trailing partial character is allowed
+# iff it is a byte-prefix of some character in an allowed script's block —
+# UTF-8 byte order tracks codepoint order, so comparing the partial against the
+# truncated endpoints suffices. (A lead-byte-only check would be too coarse for
+# 3-byte scripts: 0xE0 starts Devanagari but also Thai, Lao, and Tibetan.)
+_SCRIPT_BYTE_RANGES = {
+    "CYRILLIC": ("\u0400".encode(), "\u052f".encode()),  # Cyrillic + supplement
+    "HEBREW": ("\u0590".encode(), "\u05ff".encode()),
+    "ARABIC": ("\u0600".encode(), "\u06ff".encode()),
+    "DEVANAGARI": ("\u0900".encode(), "\u097f".encode()),
 }
 
 
+def _partial_in_ranges(seq: bytes, ranges: list[tuple[bytes, bytes]]) -> bool:
+    """True if `seq` (an incomplete UTF-8 character) is a byte-prefix of some
+    character inside one of the (lo, hi) codepoint-block byte ranges."""
+    return any(lo[: len(seq)] <= seq <= hi[: len(seq)] for lo, hi in ranges)
+
+
 def _fragment_bytes_allowed(
-    core: bytes, lead_ranges: list[tuple[int, int]], allowed_scripts: set[str]
+    core: bytes, ranges: list[tuple[bytes, bytes]], allowed_scripts: set[str]
 ) -> bool:
     """Walk a token's raw bytes (known NOT to be fully-valid UTF-8) and decide
     whether everything it can contribute is compatible with the allowed
     scripts: complete chars must be allowed-script/ASCII, and a trailing
-    partial character's lead byte must sit in an allowed script's range.
+    partial character must be a byte-prefix of an allowed script's block.
     Leading continuation bytes are fine — they finish a character started by
     the PREVIOUS token, which was itself script-checked."""
     i = 0
@@ -385,8 +401,8 @@ def _fragment_bytes_allowed(
             return False
         seq = core[i : i + need + 1]
         if len(seq) < need + 1:
-            # trailing partial character: judge by its lead byte
-            return any(lo <= b <= hi for lo, hi in lead_ranges)
+            # trailing partial character: must be a prefix of an allowed block
+            return _partial_in_ranges(seq, ranges)
         try:
             ch = seq.decode("utf-8")
         except UnicodeDecodeError:
@@ -408,8 +424,8 @@ def get_fragment_tokens_to_unblock(language_code: str) -> tuple[int, ...]:
     those characters outright. This returns the SAFE subset to re-allow for a
     language: fragments whose bytes can only produce allowed-script
     characters. Pure continuation-byte tokens are included — they cannot
-    START a character, and every character's lead byte is still gated, so an
-    out-of-script character can never be assembled. Latin-script languages
+    START a character, and every character's start bytes are still gated, so
+    an out-of-script character can never be assembled. Latin-script languages
     return () (all their characters have complete tokens), so their masks are
     unchanged.
     """
@@ -419,10 +435,10 @@ def get_fragment_tokens_to_unblock(language_code: str) -> tuple[int, ...]:
     if group is None:
         return ()
     allowed_scripts = set(group["allowed_scripts"])
-    lead_ranges = [
-        _SCRIPT_LEAD_BYTES[s] for s in allowed_scripts if s in _SCRIPT_LEAD_BYTES
+    ranges = [
+        _SCRIPT_BYTE_RANGES[s] for s in allowed_scripts if s in _SCRIPT_BYTE_RANGES
     ]
-    if not lead_ranges:
+    if not ranges:
         return ()
 
     _get_vocab()  # ensure _tok is initialized
@@ -441,7 +457,7 @@ def get_fragment_tokens_to_unblock(language_code: str) -> tuple[int, ...]:
             continue  # fully valid UTF-8 — not a fragment
         except UnicodeDecodeError:
             pass
-        if _fragment_bytes_allowed(core, lead_ranges, allowed_scripts):
+        if _fragment_bytes_allowed(core, ranges, allowed_scripts):
             out.append(token_id)
     return tuple(out)
 
