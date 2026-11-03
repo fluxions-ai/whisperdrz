@@ -10,19 +10,21 @@ This is a write-up of what worked, what didn't, and what I'd do with more budget
 
 ## Results at a glance
 
-Every number below is measured on the **publicly released checkpoint**, so it's what you'd actually get. The honest one-line summary: transcription is strong, timing is decent, diarization is usable but well behind specialist systems, and events are showing some signal, but need more data to improve further.
+Every number below is measured on the **publicly released checkpoint**, so it's what you'd actually get. The honest one-line summary: transcription is strong, timing is decent, diarization is close to specialist systems on interviews and phone calls but behind them on long meetings, and events are showing some signal, but need more data to improve further.
 
 | Capability | Metric (dataset) | WhisperDRZ | Reference |
 |---|---|---|---|
 | Transcription, clean English | WER ([ESB](https://huggingface.co/datasets/esb/datasets), 1000) | **9.6%** macro / 5.9% micro | whisper-large-v3: 7.4% |
-| Transcription, conversational | WER (internal, 26) | 11.1% | — |
+| Transcription, conversational | WER (internal, 23) | 10.3% | — |
 | Number formatting | format-exact / digit-recall (267) | 23.6% / 34.8% | whisper-large-v3: 32.2% / 59.9% |
-| Diarization | DER ([VoxConverse](https://github.com/joonson/voxconverse) dev) | 26.3% (overlap **48.6%**) | specialist systems ~10–25% |
-| Diarization | DER ([CALLHOME](https://huggingface.co/datasets/talkbank/callhome) eng / [AMI](https://groups.inf.ed.ac.uk/ami/corpus/) test) | 38.6% / 50.6% | specialist systems ~10–25% |
-| Speaker attribution | WDER (internal) / cpWER (AMI) | 33% / 72% | no-linking baseline: ~42% |
+| Diarization | DER ([VoxConverse](https://github.com/joonson/voxconverse) dev) | 11.4% (overlap **43.9%**) | specialist systems ~10–25% |
+| Diarization | DER ([CALLHOME](https://huggingface.co/datasets/talkbank/callhome) eng / [AMI](https://groups.inf.ed.ac.uk/ami/corpus/) test) | 21.5% / 34.3% | specialist systems ~10–25% |
+| Speaker attribution | WDER (internal) / cpWER (AMI) | 26% / 32% | no-linking baseline: ~42% |
 | Word timing | MAE (full pipeline) | median ~90 ms (mean ~1.5 s) | — |
 | Non-speech events | NSER (internal) | ~59% | — |
 | Multilingual | WER/CER ([FLEURS](https://huggingface.co/datasets/google/fleurs)) | <7% on major langs; degrades low-resource | — |
+
+The transcription, diarization and speaker-attribution rows were re-measured in 2026-11, after inference fixes ported from the production code (same weights; see the README's note). The number-formatting, timing, event and multilingual rows are from the code as first released.
 
 The rest of this post is how each of those works, and where the numbers come from.
 
@@ -92,7 +94,7 @@ The plan was elegant: add a **speaker embedding head** that decodes a speaker ve
 
 It wasn't. On real multi-speaker audio the integrated head was **no better than not linking speakers at all** — its cross-chunk word diarization error rate matched the no-op baseline. The embeddings simply didn't generalize from training conditions to noisy, overlapping real audio. (Part of the problem was a train/inference mismatch in *where* the embedding was read from, but even accounting for that, the head underperformed.)
 
-So WhisperDRZ falls back to an external speaker-embedding model (ECAPA2) with per-line clustering to link speakers across chunks. It helps measurably — on the internal eval it brings word-diarization error rate down to about **33%, from ~42% with no cross-chunk linking** — but two things are worth being honest about: a third of words still land on the wrong speaker, and the whole approach leans on an unprincipled clustering step rather than something the model itself learned. The diarization quality you saw on VoxConverse above is *carried* by this external linker, not by WhisperDRZ's own speaker representation.
+So WhisperDRZ falls back to an external speaker-embedding model (ECAPA2) with per-line clustering to link speakers across chunks. It helps measurably — on the internal eval it brings word-diarization error rate down to about **26%, from ~42% with no cross-chunk linking** (that baseline measured on the code as first released) — but two things are worth being honest about: a quarter of words still land on the wrong speaker, and the whole approach leans on an unprincipled clustering step rather than something the model itself learned. The diarization quality you saw on VoxConverse above is *carried* by this external linker, not by WhisperDRZ's own speaker representation.
 
 Beyond the accuracy, clustering is an inherently unstable, offline approach to speaker ID, and it makes true streaming hard (though not impossible). The right answer is in-context speaker identification — more on that below.
 
@@ -153,34 +155,35 @@ Transcription is the easy part; "who said what" is the harder claim, so I measur
 
 | VoxConverse dev (216 files) | DER |
 |---|---|
-| **Overall (corpus)** | **26.3%** |
-| Mean per-file (macro) | 31.1% |
-| **Overlap regions only** | **48.6%** |
+| **Overall (corpus)** | **11.4%** |
+| Mean per-file (macro) | 17.7% |
+| **Overlap regions only** | **43.9%** |
 
-> Re-measurement note: an earlier revision of this post reported 40.7% overall
-> and 63.4% overlap. The numbers above are a re-run on the released checkpoint
-> with the current scoring pipeline (pyannote.metrics, 0.25s collar, overlap
-> scored, corpus-level DER). Part of the old gap is per-file (macro) averaging —
-> a couple of near-silence clips hit >100% DER and drag a per-file mean up — but
-> that only accounts for some of it; the remainder is still being reconciled. The
-> corpus DER (total error time over total reference speech) is the standard figure.
+> Re-measurement note: earlier revisions of this post reported 40.7% overall /
+> 63.4% overlap, then 26.3% / 48.6%. The first came from a different scoring
+> setup; the second is the code as first released. The numbers above are the same
+> weights after the 2026-11 inference fixes (a CUDA-graph replay race that
+> corrupted decoding on files over ~60 s, speaker clustering by file length, and
+> dropping lines the decoder wrote twice over the same time), scored with
+> pyannote.metrics at a 0.25s collar, overlap scored, corpus-level DER. The old
+> code scored the same way gives 26.0%.
 
 The honest read:
 
-- **~26% DER overall.** Specialist diarizers ([pyannote](https://github.com/pyannote/pyannote-audio), the [VoxSRC](https://mm.kaist.ac.kr/datasets/voxceleb/voxsrc/workshop.html) challenge systems) land roughly in the **10–25%** range on this data. So WhisperDRZ — an ASR-first model with diarization folded into its output format — is *usable* and closer to the pack than earlier numbers suggested, but still **not competitive with purpose-built diarization systems**.
-- **Overlap is the weak spot (49% DER, mostly missed detection).** WhisperDRZ can *represent* overlapping speech in its channel format, but actually getting overlap *right* on real, crowded audio is much harder than the format makes it look — on overlap regions the error is dominated by *missed* speech, not confusion. Overlap is an open problem here, not a solved feature.
+- **~11% DER overall.** Specialist diarizers ([pyannote](https://github.com/pyannote/pyannote-audio), the [VoxSRC](https://mm.kaist.ac.kr/datasets/voxceleb/voxsrc/workshop.html) challenge systems) land roughly in the **10–25%** range on this data, mostly scored without a collar, so the comparison is indicative. WhisperDRZ — an ASR-first model with diarization folded into its output format — now sits at the low end of that range on VoxConverse; long meetings (AMI, below) are where it still trails.
+- **Overlap is the weak spot (44% DER, almost all missed detection).** WhisperDRZ can *represent* overlapping speech in its channel format, but actually getting overlap *right* on real, crowded audio is much harder than the format makes it look — on overlap regions the error is dominated by *missed* speech, not confusion. Overlap is an open problem here, not a solved feature.
 - **Cross-chunk speaker linking matters enormously.** Without the ECAPA2 step, speaker labels scramble across 30-second chunks and DER roughly doubles. The embedding-based linking is doing a lot of the work — and, as the speaker section above admits, it's the least principled part of the system.
-- **No VAD = false alarm.** WhisperDRZ has no voice-activity gate, so it transcribes over music and silence; on VoxConverse false alarm (15.8%) is the single largest error component, and on mostly-non-speech clips it explodes (a couple exceed 100% DER, where hypothesis speech dwarfs the few seconds of real reference speech). And this isn't hypothetical — gating the hypothesis to detected speech *before* scoring recovers a real, measurable slice (see below).
+- **No VAD = false alarm.** WhisperDRZ has no voice-activity gate, so it transcribes over music and silence; on VoxConverse false alarm (4.6%) is still the largest error component, and on mostly-non-speech clips it explodes (a couple exceed 100% DER, where hypothesis speech dwarfs the few seconds of real reference speech). And this isn't hypothetical — gating the hypothesis to detected speech *before* scoring recovers a real, measurable slice (see below).
 
 **How much does a VAD buy?** Because there's no voice-activity gate in the pipeline, a lot of the DER is speech-detection, not diarization. Gating the hypothesis to detected speech before scoring — silero-VAD as a realistic off-the-shelf detector, and reference speech regions as the oracle ceiling — separates the two:
 
 | Benchmark | DER (ungated) | + silero VAD | + oracle VAD |
 |---|---|---|---|
-| VoxConverse dev | 26.3% | 24.0% | 20.9% |
-| CALLHOME eng | 38.6% | 34.2% | 28.6% |
-| AMI test | 50.6% | 40.6% | 31.1% |
+| VoxConverse dev | 11.4% | 10.3% | 7.1% |
+| CALLHOME eng | 21.5% | 19.0% | 12.9% |
+| AMI test | 34.3% | 27.9% | 16.7% |
 
-The gains are biggest where false alarm was worst (AMI: 50.6 → 40.6% with a real VAD, → 31.1% with perfect detection). What a VAD *cannot* recover is speaker **confusion** and over-hypothesized **overlap** — the genuine diarization error. So the honest reading is two-sided: the shipped model's out-of-box DER is inflated by a missing component that's cheap to add, but even with perfect speech detection the confusion floor keeps it behind purpose-built diarizers. The ungated numbers are what you actually get today; the gated numbers are the near-term headroom.
+The gains are biggest where false alarm was worst (AMI: 34.3 → 27.9% with a real VAD, → 16.7% with perfect detection). What a VAD *cannot* recover is **missed** speech (mostly overlap the model doesn't transcribe) and speaker **confusion** — the genuine diarization error, 7–17% here even with perfect detection. So the honest reading is two-sided: the shipped model's out-of-box DER is inflated by a missing component that's cheap to add, and what remains after it is mostly overlap. The ungated numbers are what you actually get today; the gated numbers are the near-term headroom.
 
 ### Beyond VoxConverse: CALLHOME and AMI
 
@@ -191,26 +194,25 @@ single mixed-headset channel). All DER at the 0.25s collar, overlap scored:
 
 | Benchmark | WER | DER (miss / FA / conf) | cpWER / tcpWER |
 |---|---|---|---|
-| VoxConverse dev (216) | — | **26.3%** (3.1 / 15.8 / 7.5) | — |
-| CALLHOME eng (140, 2-spk telephone) | — | **38.6%** (5.9 / 14.0 / 18.7) | — |
-| AMI test (16 mtgs, Mix-Headset) | **22.8%** | **50.6%** (10.6 / 28.9 / 11.1) | **72% / 84%** |
+| VoxConverse dev (216) | — | **11.4%** (3.1 / 4.6 / 3.7) | — |
+| CALLHOME eng (140, 2-spk telephone) | — | **21.5%** (6.1 / 8.9 / 6.5) | — |
+| AMI test (16 mtgs, Mix-Headset) | **22.8%** | **34.3%** (13.1 / 17.9 / 3.3) | **31.6% / 37.1%** |
 
 Two things stand out:
 
-- **Transcription holds up; attribution doesn't.** On AMI the raw word error rate
-  is a respectable 22.8%, but the concatenated cpWER is 72% — a ~49-point gap that
-  is almost entirely *who said what*. The model hears the words; it just puts them
-  on the wrong speaker. CALLHOME tells the same story more simply: confusion
-  (18.7%) is the dominant DER component even on clean 2-party telephone.
-- **The natural clustering over-fragments, and that flatters DER.** On long AMI
-  meetings the ECAPA2 linker splits 4 real speakers into as many as ~35 clusters.
-  DER's optimal mapping quietly absorbs the excess as false alarm while keeping
-  confusion low, so the "natural" DER *understates* the problem. Forcing the true
-  speaker count (oracle-K) raises AMI DER to 64.9% (confusion 26.6%) and is what
-  makes the permutation-based cpWER/tcpWER computable at all. The over-fragmentation
-  is the same weakness the speaker section describes, now visible at meeting scale.
+- **Transcription holds up, and so, mostly, does attribution.** On AMI the raw
+  word error rate is 22.8% and the concatenated cpWER 31.6%: *who said what* costs
+  ~9 points on top of the words. CALLHOME confusion is 6.5% on 2-party telephone.
+- **Clustering by length fixed the over-fragmentation.** On long AMI meetings the
+  ECAPA2 linker used to split 4 real speakers into as many as ~35 clusters; DER's
+  optimal mapping absorbed the excess as false alarm, and cpWER/tcpWER could only
+  be computed by forcing the true speaker count (which gave 72% / 84%). Files with
+  60+ speaker lines now cluster at a tighter threshold, with small clusters folded
+  into their nearest neighbour: 5 speakers per meeting (median, max 8), and the
+  cp-metrics are computable as-is. What's left on AMI is mostly missed overlap
+  (13.1% miss) and the missing VAD (17.9% false alarm).
 
-So: WhisperDRZ tells you who said what well enough to be useful on clean, few-speaker audio, but trails dedicated diarizers on crowded in-the-wild conversation — and overlap specifically remains unsolved. (Baseline caveat: I haven't yet run pyannote on this exact 216-file set; the 10–25% reference is from published numbers, so treat the comparison as indicative.)
+So: WhisperDRZ tells you who said what well on interviews, panels and phone calls, trails dedicated diarizers on long meetings, and overlap specifically remains unsolved. (Baseline caveat: I haven't yet run pyannote on this exact 216-file set; the 10–25% reference is from published numbers, so treat the comparison as indicative.)
 
 ## What about other languages?
 

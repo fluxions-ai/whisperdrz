@@ -97,53 +97,59 @@ WhisperDRZ reports transcription, diarization, and joint metrics:
   speaker confusion, over total reference speech, at a 0.25s collar. The standard
   diarization metric; speaker-count- and word-agnostic.
 
-Measured on the released checkpoint:
+Measured on the released checkpoint with this package's defaults (natural
+speaker clustering, no speaker count given), 2026-11:
 
 | Benchmark | WER | DER (miss / FA / conf) | cpWER / tcpWER |
 |---|---|---|---|
 | ESB (English ASR, 1000 utts) | 9.6% macro / 5.9% micro | — | — |
-| Internal conversational (26 clips) | 11.1% | — (WDER 33%) | 46% cpWER |
-| VoxConverse dev (216, overlap-heavy) | — | **26.3%** (3.1 / 15.8 / 7.5) | — |
-| CALLHOME eng (140, 2-spk telephone) | — | **38.6%** (5.9 / 14.0 / 18.7) | — |
-| AMI test (16 meetings, Mix-Headset) | 22.8% | **50.6%** (10.6 / 28.9 / 11.1) | 72% / 84% |
+| Internal conversational (23 clips) | 10.3% | — (WDER 26%) | 20% cpWER |
+| VoxConverse dev (216, overlap-heavy) | — | **11.4%** (3.1 / 4.6 / 3.7) | — |
+| CALLHOME eng (140, 2-spk telephone) | — | **21.5%** (6.1 / 8.9 / 6.5) | — |
+| AMI test (16 meetings, Mix-Headset) | 22.8% | **34.3%** (13.1 / 17.9 / 3.3) | 31.6% / 37.1% |
 
-DER is at the standard 0.25s collar, scoring overlapping speech. AMI cpWER/tcpWER
-and the 22.8% WER use **oracle speaker count** (the model is told how many
-speakers each meeting has); its natural clustering over-fragments long meetings
-(up to ~35 speakers where there are 4), which makes the permutation-based
-cp-metrics intractable. Interestingly, oracle-count *raises* AMI DER to 64.9%
-(confusion 26.6%): the natural over-fragmentation was quietly flattering DER,
-whose optimal mapping absorbs excess clusters as false alarm while keeping
-confusion low.
+DER is at the standard 0.25s collar, scoring overlapping speech (AMI inside its
+UEM). cpWER/tcpWER (meeteval, 5s collar for tcpWER) and WDER are micro-averaged;
+the AMI WER is speaker-agnostic (all words in time order). Long recordings (60+
+speaker lines) are clustered tighter and small clusters folded into their nearest
+neighbour, so a 4-person AMI meeting comes out with 5 speakers (median, max 8),
+and the permutation-based cp-metrics are computable without telling the model the
+speaker count.
 
 **WhisperDRZ is an ASR-first model.** Transcription is strong across the board
-(AMI Mix-Headset WER 22.8%), but diarization trails purpose-built systems
-(~10–25% DER) — confusion dominates, and the ~49-point gap between AMI WER (23%)
-and cpWER (72%) is almost entirely speaker attribution: the words are right, but
-*who said what* is often wrong, especially on long, overlapping multi-party
-audio. See [the write-up](writeup.md) for full analysis (timing, non-speech
-events, multilingual).
+(AMI Mix-Headset WER 22.8%). Diarization is in the range published for
+purpose-built systems on VoxConverse and CALLHOME (~10–25% DER, though those are
+mostly scored without a collar, so not like-for-like), and behind them on long
+multi-party meetings: on AMI, attribution adds ~9 points on top of the
+words (WER 23% vs cpWER 32%), and overlapped speech is mostly missed (56% DER
+inside overlap). See [the write-up](writeup.md) for full analysis (timing,
+non-speech events, multilingual).
 
 **A note on false alarm — WhisperDRZ has no VAD.** It transcribes over silence
-and music, so false alarm is a large part of the DER above (28.9% of the 50.6% on
-AMI). Gating the hypothesis to detected speech *before* scoring — a component the
-shipped model doesn't include — recovers much of it. The DER above is the honest
-out-of-the-box number; the columns below show what a non-speech filter would buy:
+and music, so false alarm is the largest part of the DER above (17.9% of the
+34.3% on AMI). Gating the hypothesis to detected speech *before* scoring — a
+component the shipped model doesn't include — recovers much of it. The DER above
+is the honest out-of-the-box number; the columns below show what a non-speech
+filter would buy:
 
 | Benchmark | DER (ungated) | + silero VAD | + oracle VAD |
 |---|---|---|---|
-| VoxConverse dev | 26.3% | 24.0% | 20.9% |
-| CALLHOME eng | 38.6% | 34.2% | 28.6% |
-| AMI test | 50.6% | 40.6% | 31.1% |
+| VoxConverse dev | 11.4% | 10.3% | 7.1% |
+| CALLHOME eng | 21.5% | 19.0% | 12.9% |
+| AMI test | 34.3% | 27.9% | 16.7% |
 
 silero VAD is a real off-the-shelf detector; oracle VAD (reference speech regions)
 is the ceiling. What a VAD *cannot* fix is speaker confusion and over-hypothesized
 overlap — the genuine diarization error that remains after detection is perfect.
 
-> Note: an earlier revision reported VoxConverse dev DER as 40.7%. The 26.3%
-> above is a re-measurement on the released checkpoint with the current scoring
-> pipeline (pyannote.metrics, 0.25s collar, overlap scored); the discrepancy is
-> still being reconciled.
+> Note: these numbers replace earlier ones (VoxConverse 26.3%, CALLHOME 38.6%,
+> AMI 50.6% DER, AMI cpWER 72% with oracle speaker count). Same weights; the
+> difference is inference fixes made in 2026-11: a CUDA-graph replay race that
+> corrupted decoding on files over ~60 s (and made output change run to run),
+> speaker clustering by file length, and dropping lines the decoder wrote twice
+> over the same time. The old code, scored with the same pipeline, gives
+> VoxConverse 26.0%, CALLHOME 42.1%, AMI 49.8% DER. An earlier VoxConverse figure
+> of 40.7% came from a different scoring setup.
 
 Reproduce WER/WDER/cpWER on your own data with the metrics in `whisperdrz.evals`
 and the runner:
