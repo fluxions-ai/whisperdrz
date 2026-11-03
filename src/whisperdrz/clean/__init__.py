@@ -6,6 +6,8 @@ from .patterns import (
     TIMINGS_FORMAT,
 )
 from .speakers import (
+    drop_contentless_lines,
+    drop_overlapping_copy_lines,
     fix_speaker_ids,
     merge_consecutive_speakers,
     remove_speaker_tags_not_after_newline,
@@ -36,6 +38,8 @@ __all__ = [
     "fix_nonmonotonic_timestamps",
     "fix_speaker_ids",
     "merge_consecutive_speakers",
+    "drop_contentless_lines",
+    "drop_overlapping_copy_lines",
     "offset_timestamps",
     "parse_timing",
     "quantize_timestamps",

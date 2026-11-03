@@ -193,6 +193,8 @@ from whisperdrz.clean import (
     SPEAKER_LINE_START,
     TIMINGS_FORMAT,
     consolidate_adjacent_tags,
+    drop_contentless_lines,
+    drop_overlapping_copy_lines,
     fix_nonmonotonic_timestamps,
     fix_speaker_ids,
     merge_consecutive_speakers,
@@ -401,12 +403,20 @@ def extract_line_audio_segments(
     return results
 
 
+# remap_speakers_per_line's setting by length: files embedding at least this many lines
+# cluster as long meetings (threshold 0.9 + min_cluster_size), shorter ones at 1.1.
+# 1.1 wins below 40 lines (100 labelled 1-4 min clips: cpWER 27.8 vs 44.0 at 20-40 lines),
+# 0.9 from 77 up (a 6-min NOTSOFAR meeting: 23.4 vs 26.2); between, only 2 clips (a tie).
+REMAP_LONG_MIN_LINES = 60
+
+
 def remap_speakers_per_line(
     text: str,
     audio: torch.Tensor,
     speaker_model,
-    threshold: float = 1.1,
+    threshold: float | None = None,
     min_duration: float = 1.0,
+    min_cluster_size: int | None = None,
 ) -> str:
     """Remap speaker IDs by clustering per-line embeddings from scratch.
 
@@ -418,9 +428,18 @@ def remap_speakers_per_line(
        preferring neighbors whose model-predicted ID matches the short line's
 
     Args:
-        threshold: Euclidean distance threshold for AHC clustering.
-            For L2-normalized ECAPA2 embeddings, ~1.0 is a good starting point.
+        threshold: Euclidean distance threshold for AHC clustering (L2-normalized
+            ECAPA2 embeddings). None = by length (below).
         min_duration: Minimum line duration in seconds to attempt embedding.
+        min_cluster_size: clusters of fewer lines join the nearest larger one
+            (capped at 10% of the embedded lines). None = by length (below).
+
+    By length: a file that embeds
+    REMAP_LONG_MIN_LINES lines or more (long meetings) clusters at 0.9 with
+    min_cluster_size 3; 1.1 alone there both over-split (204 speakers for 33 on
+    7 meetings) and lumped real speakers together (cpWER 72 -> 52; held out
+    58.5 -> 39.0). Shorter ones keep 1.1 alone, which 0.9 loses to on 150
+    labelled 8-60 s clips (cpWER 32.4 vs 39.8, speakers over-counted on 86 vs 53).
     """
     segments = parse_to_segments(text)
     if not segments:
@@ -441,8 +460,16 @@ def remap_speakers_per_line(
     if len(embedded) < 2:
         return text
 
+    long_file = len(embedded) >= REMAP_LONG_MIN_LINES
+    if threshold is None:
+        threshold = 0.9 if long_file else 1.1
+    if min_cluster_size is None:
+        min_cluster_size = 3 if long_file else 1
+
     # Cluster from scratch
-    cluster_map = cluster_speakers(embedded, threshold=threshold)
+    cluster_map = cluster_speakers(
+        embedded, threshold=threshold, min_cluster_size=min_cluster_size
+    )
 
     # Build line_idx -> cluster_id for embedded lines
     embedded_cluster: dict[int, int] = {}
@@ -621,7 +648,8 @@ class Transcriber:
         speaker_tags: bool | None = None,
         speaker_remap: bool = True,
         speaker_remap_model: str = "ecapa2",
-        speaker_remap_threshold: float = 1.1,
+        speaker_remap_threshold: float | None = None,
+        speaker_remap_min_cluster_size: int | None = None,
         n_warm: int = 0,
         detect_once: bool = True,
         detect_once_languages: set[str] | None = None,
@@ -641,6 +669,14 @@ class Transcriber:
             precomputed_mels: Expect chunk["mel"] instead of chunk["audio"]
             allow_tags: Allow <tag> tokens (e.g. <emotion:happy>, <accent:british>)
             allow_asterisks: Allow * tokens (e.g. *emphasis*)
+            speaker_remap_threshold, speaker_remap_min_cluster_size: the ECAPA2
+                per-line remap's AHC distance threshold, and the cluster size below
+                which a cluster joins its nearest larger one. None (default) picks
+                by length: long meetings (60+ embedded lines) 0.9 + 3, shorter
+                files 1.1 alone.
+            detect_once, detect_once_languages: with lang=None, detect the
+                language once per file and force it for every window, for these
+                languages (default {"en"}); others keep per-window detection.
         """
         from whisperdrz.inference_utils import InferenceState, init_for_model
         from whisperdrz.model import WhisperDRZ
@@ -671,6 +707,7 @@ class Transcriber:
         self.speaker_remap = speaker_remap
         self.speaker_remap_model_name = speaker_remap_model
         self.speaker_remap_threshold = speaker_remap_threshold
+        self.speaker_remap_min_cluster_size = speaker_remap_min_cluster_size
         self.speaker_remap_model = None
         if model is not None:
             self.model = model
@@ -984,6 +1021,7 @@ class Transcriber:
                 audio,
                 self.speaker_remap_model,
                 threshold=self.speaker_remap_threshold,
+                min_cluster_size=self.speaker_remap_min_cluster_size,
             )
 
         merged = merge_consecutive_speakers(combined)
@@ -1558,6 +1596,10 @@ class Transcriber:
             cleaned = remove_dangling_timestamps(cleaned)
             # Remove orphaned timestamps: [0] <|t|> <|t2|> -> [0] <|t2|>
             cleaned = re.sub(r"(\[\d+\] )<\|[\d.]+\|> (<\|[\d.]+\|>)", r"\1\2", cleaned)
+            # The decoder's copy lines (one utterance on several speaker lines over the same
+            # time) and lines that say nothing (`[3]`, `[0] <|t|> <|t|>`); one window at a time.
+            cleaned = drop_overlapping_copy_lines(cleaned)
+            cleaned = drop_contentless_lines(cleaned)
 
             # Normalize speaker IDs so first speaker is [0], second is [1], etc.
             # Store reverse mapping so speaker clustering can map cleaned IDs back
