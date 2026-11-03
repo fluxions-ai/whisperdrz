@@ -4,6 +4,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 
 import torch
+import torch.nn.functional as F
 
 from whisperdrz.audio import LogMelSpectrogram
 from whisperdrz.speaker_clustering import (
@@ -218,6 +219,73 @@ def _strip_to_last_closing(cur: str) -> str:
             return "\n".join(lines[: i + 1])
         # Single orphaned opening on this line — drop it, check previous line
     return cur
+
+
+SPEAKER_LINE_RE = re.compile(r"^\[(\d+|c)\]\s*")
+_TIMING_RE = re.compile(r"<\|(\d+\.\d+)\|>")
+
+_BRACKET_TAG_RE = re.compile(r"\[[^\]]*\]")
+
+
+def _words_only(text: str) -> str:
+    """Bare words: timestamps and every [tag] (speaker tags included) removed."""
+    return " ".join(_BRACKET_TAG_RE.sub(" ", _TIMING_RE.sub(" ", text)).split())
+
+
+_STUTTER_RE = re.compile(r"(\S{2,12})\1{2,}")  # atatat, daydayday, .com.com.com
+_QUOTE_RUN_RE = re.compile(r'(?:"\s*){3,}')
+
+
+def _tail_worth_keeping(words: str) -> bool:
+    """A dropped tail is only worth restoring if it reads like speech.
+
+    Window tails are exactly where the decoder degenerates when the audio runs
+    out (`atatatatat`, `daydayday`, `therestishhistory.com.com.com`, `" " "`),
+    and the old strip-and-re-decode threw those away for free. Restoring must
+    never bring them back, so anything degenerate is not remembered at all.
+    """
+    if not re.search(r"[A-Za-z0-9]", words):
+        return False
+    if _STUTTER_RE.search(words) or _QUOTE_RUN_RE.search(words):
+        return False
+    toks = words.lower().split()
+    # Immediate word repeats beyond a natural stutter ("I- I- I" is fine, x4 is not).
+    return not any(
+        toks[i] == toks[i - 1] == toks[i - 2] == toks[i - 3] and not toks[i].isdigit()
+        for i in range(3, len(toks))
+    )
+
+
+def _split_stripped_tail(cur: str) -> tuple[str, str]:
+    """(kept, dropped_words): what `_strip_to_last_closing` keeps, and the words
+    it throws away for the next window to re-decode. Empty string if the tail
+    had no words worth remembering."""
+    kept = _strip_to_last_closing(cur)
+    tail = cur[len(kept) :] if cur.startswith(kept) else ""
+    words = _words_only(tail)
+    return kept, (words if _tail_worth_keeping(words) else "")
+
+
+def _restore_stripped_tail(s, cur: str) -> str:
+    """Give a window back the words its predecessor dropped, if it found none.
+
+    On EOT with audio remaining, the untimed tail of a window is stripped and
+    that span is re-decoded by the next window, on the assumption the re-decode
+    will do better. Starting mid-utterance it frequently does WORSE -- on
+    call-centre clips a first pass that read "plus 234 802 5550 147." was
+    replaced by a continuation that heard only "[pause]", losing the number.
+    So: if the continuation produced no words at all, the dropped words win.
+    Runs on the raw decoder output before the batched DTW, so this window's
+    cross-attention (which does cover that audio) gets the chance to time them.
+    """
+    tail = getattr(s, "_stripped_tail_words", "")
+    if not tail:
+        return cur
+    s._stripped_tail_words = ""
+    if re.search(r"[A-Za-z0-9]", _words_only(cur)):
+        return cur  # the re-decode produced words: trust it
+    m = SPEAKER_LINE_RE.match(cur)
+    return (m.group(0) if m else "") + tail
 
 
 @dataclass
@@ -537,6 +605,8 @@ class Transcriber:
         speaker_remap_model: str = "ecapa2",
         speaker_remap_threshold: float = 1.1,
         n_warm: int = 0,
+        detect_once: bool = True,
+        detect_once_languages: set[str] | None = None,
     ):
         """
         Args:
@@ -591,6 +661,16 @@ class Transcriber:
         else:
             raise ValueError("Either model_path or model must be provided")
         self.detect_language = lang is None
+        # With lang=None: detect the language once per file (see transcribe())
+        # rather than letting every 30 s window -- and every continuation --
+        # re-detect it from a prefix of just [sot].
+        self.detect_once = detect_once
+        # Forcing the detected language is validated (and a win) for English
+        # only: forcing `ru` lost 27-39% of words even when the detection was
+        # right, so other languages keep per-window auto-detection.
+        self.detect_once_languages = (
+            {"en"} if detect_once_languages is None else set(detect_once_languages)
+        )
         self.lang = lang
 
         if speaker_tags is None:
@@ -621,6 +701,55 @@ class Transcriber:
         # slot_idx -> (event, slot_idx) for slots whose prefill is in flight on
         # prefill_stream. Main stream waits on the event before using the KV.
         self.prefill_events: dict[int, torch.cuda.Event] = {}
+
+    def _set_language(self, lang: str | None, detect: bool | None = None):
+        """Switch the Transcriber's global init prefix to `lang` (None = auto),
+        updating every idle slot's initial tokens. Returns the previous
+        (lang, detect_language) so the caller can restore it."""
+        prev = (self.lang, self.detect_language)
+        self.lang = lang
+        self.detect_language = (lang is None) if detect is None else detect
+        self.init_tokens = self._build_init_tokens(lang)
+        self.init_tensor = torch.tensor(self.init_tokens)
+        self.init_len = len(self.init_tokens)
+        for s in self.states:
+            s.initial_tokens = self.init_tensor.clone()
+        return prev
+
+    @torch.inference_mode()
+    def detect_file_language(self, chunks: list[dict]) -> str:
+        """One language for the whole file: encoder + a single decoder step from
+        [sot] on up to three chunks (first / middle / last), argmax over language
+        tokens, vote weighted by confidence. Same primitive as
+        language detection, but on the already-loaded model."""
+        if self.model is None:
+            self.load_model()
+        if getattr(self, "tomel", None) is None:
+            self.tomel = LogMelSpectrogram(n_mels=self.model.dims.n_mels)
+        tok = self.model.tokenizer
+        idx = sorted({0, len(chunks) // 2, len(chunks) - 1})
+        picked = [chunks[i] for i in idx if chunks[i].get("audio") is not None]
+        if not picked:
+            return "en"
+        param = next(self.model.parameters())
+        device, dtype = param.device, param.dtype
+        mels = []
+        for c in picked:
+            a = c["audio"]
+            a = torch.as_tensor(a).float().squeeze()
+            n_samples = int(self.max_audio_length * 16000)
+            a = a[:n_samples] if a.shape[0] >= n_samples else F.pad(a, (0, n_samples - a.shape[0]))
+            mels.append(self.tomel(a.unsqueeze(0)).squeeze(0))
+        mel = torch.stack(mels).to(device, dtype)
+        lang_ids = torch.tensor(list(tok.all_language_tokens), device=device)
+        sot = torch.full((mel.shape[0], 1), tok.sot, device=device, dtype=torch.long)
+        with flash_kernel():
+            xa = self.model.encoder(mel)
+            logits, _ = self.model.decoder(sot, xa)
+        probs = torch.softmax(logits[:, -1, lang_ids].float(), dim=-1)  # [n, n_langs]
+        votes = probs.sum(dim=0)
+        lang = tok.decode([int(lang_ids[int(votes.argmax())])]).strip("<|>")
+        return lang
 
     def _build_init_tokens(self, lang: str | None) -> list[int]:
         tok = self.model.tokenizer
@@ -793,13 +922,30 @@ class Transcriber:
                 }
             )
 
+        # Detect the language ONCE for the file and force it for every window.
+        # Per-window auto-detection (init prefix = [sot]) was the largest garble
+        # source found: on 53 English API jobs, forcing the language cut garble
+        # lines 80 -> 48 where auto gave `sure,00000000000000` for real speech.
+        # Forced as the GLOBAL prefix, not per chunk: the batched prefill slices
+        # `self.init_len`, so a per-chunk prefix of a different length is not
+        # honoured.
+        saved_lang = None
+        if self.detect_language and self.detect_once and chunks:
+            file_lang = self.detect_file_language(chunks)
+            if file_lang in self.detect_once_languages:
+                saved_lang = self._set_language(file_lang)
+
         # Process all chunks
         all_results = []
         self.pending_chunks.extend(chunks)
-        while self.pending_chunks or any(s.status != "ready" for s in self.states):
-            results = self._run_batched_inference()
-            if results:
-                all_results.extend(results)
+        try:
+            while self.pending_chunks or any(s.status != "ready" for s in self.states):
+                results = self._run_batched_inference()
+                if results:
+                    all_results.extend(results)
+        finally:
+            if saved_lang is not None:
+                self._set_language(*saved_lang)
 
         # Sort by chunk ID to ensure correct order (continuous batching returns out-of-order)
         all_results.sort(key=lambda r: int(r.get("id", "chunk_0").split("_")[1]))
@@ -906,6 +1052,7 @@ class Transcriber:
         s = self.states[slot_idx]
         s.reset()
         s._continuation_count = 0  # Reset continuation counter for new chunk
+        s._stripped_tail_words = ""  # No dropped tail carried in from a previous chunk
         s.id = chunk["id"]
         audio = chunk.get("audio")
         if audio is not None and not isinstance(audio, torch.Tensor):
@@ -1287,7 +1434,11 @@ class Transcriber:
             # Strip trailing content after last closing timestamp when continuing
             # Next window re-covers this audio, preventing duplicate timestamps at stitch
             if more:
-                cur = _strip_to_last_closing(cur)
+                # Normally the alignment-phase cut has already captured the
+                # tail; this only adds words if the strip here drops more.
+                cur, dropped = _split_stripped_tail(cur)
+                if dropped:
+                    s._stripped_tail_words = dropped
             # Ensure speaker tags always start on a new line
             content_so_far = s.sofar.replace("[CHOP]", "").rstrip()
             if not content_so_far or content_so_far.endswith("\n"):
@@ -1452,8 +1603,18 @@ class Transcriber:
         for item in to_align:
             s = item["state"]
             out = item["cur"]
+            # If the previous window's untimed tail was cut for this window
+            # to re-decode, and this window heard nothing, hand the words
+            # back BEFORE DTW so this window's cross-attention can time them.
+            out = _restore_stripped_tail(s, out)
             if item.get("clip_to_last_timing"):
-                out = cut_after_last_timed_word(out)
+                cut = cut_after_last_timed_word(out)
+                # Remember what the cut throws away; the next window gets it
+                # back if its re-decode of that span comes up wordless.
+                dropped = _words_only(out[len(cut) :]) if out.startswith(cut) else ""
+                if _tail_worth_keeping(dropped):
+                    s._stripped_tail_words = dropped
+                out = cut
                 timing_matches = list(TIMINGS_FORMAT.finditer(out))
                 if timing_matches:
                     last_timing = float(timing_matches[-1].group(1))

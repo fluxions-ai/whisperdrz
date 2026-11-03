@@ -1374,11 +1374,15 @@ def decode_batch(
         # Asterisk state: odd count means we're inside `*...`
         in_asterisk, asterisk_force_close_reason = asterisk_state(line)
 
-        # Force timing near end OR before first word (if only tags timed so far)
+        # Force timing near end OR before first word (if only tags timed so far).
+        # force_timing_every_word opens EVERY word/tag with a timestamp; the
+        # close-before-space/newline corrections then finish each pair, so the
+        # output is <|t|>word<|t|> <|t|>word2<|t|> with nothing left untimed.
         force_timing = last_was_space and (
             near_end
             or (approaching_end and words_since_timing >= 2)
             or (even_timings and not _has_timed_word(line))
+            or (even_timings and state.force_timing_every_word)
         )
 
         # Classify into constraint groups
@@ -1966,15 +1970,19 @@ def decode_batch(
         # When model predicts a space-starting token after 5+ untimed words:
         # 1. Output just the space now
         # 2. Force timestamp on next iteration
+        # force_timing_every_word does this for EVERY space-prefixed token: a
+        # " versus" token would otherwise start the word with no opening
+        # timestamp. Splitting (rather than masking " versus") keeps the model's
+        # choice of a word over a newline; it re-predicts the word after <|t|>.
         MAX_WORDS_WITHOUT_TIMING = 5
-        if (
-            not correction_needed
-            and next_is_space
-            and not state.force_timing_every_word
-        ):
+        if not correction_needed and next_is_space:
             even_timings = ctx.get("even_timings", True)
             words_since = ctx.get("words_since_timing", 0)
-            if words_since >= MAX_WORDS_WITHOUT_TIMING and even_timings:
+            if state.force_timing_every_word:
+                split = newtext != " "
+            else:
+                split = words_since >= MAX_WORDS_WITHOUT_TIMING
+            if split and even_timings:
                 results[i] = (" ", ds._single_char_ids[" "])
                 state.force_timestamp_next = True
                 correction_needed = True
