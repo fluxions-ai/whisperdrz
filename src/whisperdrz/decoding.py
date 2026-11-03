@@ -875,6 +875,23 @@ def sample_logits(
     return torch.multinomial(probs, num_samples=1).squeeze(-1)
 
 
+_TOKEN_BYTES_CACHE: dict[int, bytes] = {}
+
+
+def _token_bytes(token_id: int) -> bytes:
+    """Raw bytes of a vocab token (for byte-fragment reassembly)."""
+    b = _TOKEN_BYTES_CACHE.get(token_id)
+    if b is None:
+        from whisperdrz.tokenizer import get_tokenizer
+
+        try:
+            b = get_tokenizer().encoding.decode_single_token_bytes(token_id)
+        except Exception:
+            b = b""
+        _TOKEN_BYTES_CACHE[token_id] = b
+    return b
+
+
 def update_state_after_decode(
     state, newtext: str, newtoken_id: int, skip_cur: bool = False
 ):
@@ -882,6 +899,12 @@ def update_state_after_decode(
 
     Tracks token_count and last_token_id as Python ints (no GPU tensors).
     Automatically skips cur update for special tokens (language, transcribe, etc.)
+
+    Byte-fragment tokens (partial UTF-8, per-token decode contains '�';
+    reachable for languages whose mask unblocks them — see
+    get_dont_predict_for_lang) are buffered as raw bytes and appended to
+    `cur` only once they assemble a valid character, so `cur` never carries
+    replacement chars for chars like word-initial ё.
     """
     state.last_token_id = newtoken_id
     state.token_count += 1
@@ -897,7 +920,20 @@ def update_state_after_decode(
     ) or newtext == ""
 
     if not skip_cur and not is_special:
-        state.cur += newtext
+        if "�" in newtext:
+            pend = state._pending_bytes + _token_bytes(newtoken_id)
+            try:
+                state.cur += pend.decode("utf-8")
+                state._pending_bytes = b""
+            except UnicodeDecodeError as e:
+                if e.reason == "unexpected end of data" and len(pend) < 8:
+                    state._pending_bytes = pend  # still mid-character
+                else:
+                    state._pending_bytes = b""  # invalid sequence — drop
+        else:
+            if state._pending_bytes:
+                state._pending_bytes = b""  # interrupted fragment — drop partial
+            state.cur += newtext
 
     cur = state.cur
     line = _get_line(cur)
