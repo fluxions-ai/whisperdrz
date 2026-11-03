@@ -594,9 +594,15 @@ def _apply_anchor_bands(
     word_anchors: list[tuple[int, float, float]] | None,
     tag_anchors: list[tuple[float, float, int | None, int | None]] | None,
     slack_frames: int,
+    col_offset: int = 0,
 ) -> None:
     """In-place anchor masking on neg_matrix. Walked out of _dtw_from_attention
-    so the batched DTW path can reuse the exact same band logic on CPU."""
+    so the batched DTW path can reuse the exact same band logic on CPU.
+
+    col_offset: audio position of neg_matrix's column 0 when the matrix was
+    sliced to a sub-range of the window; anchor times (window-absolute seconds)
+    are translated into the sliced coordinate frame.
+    """
     n_rows = neg_matrix.shape[0]
     word_tokens_lengths = [len(t) for t in external_word_tokens[:-1]]
     word_boundaries_anchor = np.cumsum([1, *word_tokens_lengths])
@@ -608,8 +614,13 @@ def _apply_anchor_bands(
                 continue
             if a_e <= seen_max_audio:
                 continue
-            a_lo = max(0, int(round(a_s * TOKENS_PER_SECOND)) - slack_frames)
-            a_hi = min(audio_cap, int(round(a_e * TOKENS_PER_SECOND)) + slack_frames)
+            a_lo = max(
+                0, int(round(a_s * TOKENS_PER_SECOND)) - slack_frames - col_offset
+            )
+            a_hi = min(
+                audio_cap,
+                int(round(a_e * TOKENS_PER_SECOND)) + slack_frames - col_offset,
+            )
             if a_lo >= a_hi:
                 continue
             r_lo = int(word_boundaries_anchor[wi])
@@ -620,8 +631,13 @@ def _apply_anchor_bands(
             seen_max_audio = a_e
     if tag_anchors:
         for a_s, a_e, p_local, n_local in tag_anchors:
-            a_lo = max(0, int(round(a_s * TOKENS_PER_SECOND)) - slack_frames)
-            a_hi = min(audio_cap, int(round(a_e * TOKENS_PER_SECOND)) + slack_frames)
+            a_lo = max(
+                0, int(round(a_s * TOKENS_PER_SECOND)) - slack_frames - col_offset
+            )
+            a_hi = min(
+                audio_cap,
+                int(round(a_e * TOKENS_PER_SECOND)) + slack_frames - col_offset,
+            )
             if a_hi <= 0 or a_lo >= audio_cap:
                 continue
             if p_local is not None and p_local < len(external_words) - 1:
@@ -683,18 +699,27 @@ def _arange_cached(n: int, device: torch.device) -> torch.Tensor:
 # Persistent pinned host buffer for the D→H transfer at the end of
 # _dtw_prep_batch. PyTorch's default .cpu() uses pageable memory (~2 GB/s on
 # this host); a pre-pinned destination via .copy_(non_blocking=True) hits
-# ~25 GB/s, dropping the dominant prep cost roughly 10x. Keyed by (shape, dtype)
-# so a workload with stable batch sizes pays the pin allocation cost once.
-_PINNED_HOST_BUFFERS: dict[tuple, torch.Tensor] = {}
+# ~25 GB/s, dropping the dominant prep cost roughly 10x.
+#
+# ONE grow-only flat buffer per dtype, viewed to the requested shape per call.
+# The old dict keyed by exact (shape, dtype) leaked unboundedly under the
+# continuous-batching server: B/T_text_pad/audio_cap vary almost every finalize,
+# so it nearly never hit and cudaHostAlloc'd a fresh 2-32MB pinned block per
+# call — the "RssShmem/pinned-host" leak (~0.5 GB/min per GPU worker; /dev/zero
+# MAP_SHARED maps growing ~70/min). Pinned blocks are cached by torch's host
+# allocator and never returned to the OS, so the cache MUST be bounded here.
+_PINNED_HOST_BUFFERS: dict[torch.dtype, torch.Tensor] = {}
 
 
 def _pinned_host_buffer(shape: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
-    key = (shape, dtype)
-    buf = _PINNED_HOST_BUFFERS.get(key)
-    if buf is None:
-        buf = torch.empty(shape, dtype=dtype, pin_memory=True)
-        _PINNED_HOST_BUFFERS[key] = buf
-    return buf
+    numel = 1
+    for d in shape:
+        numel *= d
+    buf = _PINNED_HOST_BUFFERS.get(dtype)
+    if buf is None or buf.numel() < numel:
+        buf = torch.empty(numel, dtype=dtype, pin_memory=True)
+        _PINNED_HOST_BUFFERS[dtype] = buf
+    return buf[:numel].view(shape)
 
 
 def _dtw_prep_batch(
@@ -763,12 +788,19 @@ def _dtw_from_attention(
     word_anchors: list[tuple[int, float, float]] | None = None,
     tag_anchors: list[tuple[float, float, int | None, int | None]] | None = None,
     slack_frames: int = 7,
+    audio_lo: int = 0,
+    audio_hi: int | None = None,
 ) -> list[tuple[str, float, float]]:
     """Convert raw cross-attention QK^T (selected heads, no softmax) into per-word
     timings via softmax → norm → median-filter → cost mask → DTW.
 
     attn_weights: [n_heads, T_text_full, T_audio] for ONE chunk. T_text_full
     includes sot + no_timestamps + text_tokens + eot rows.
+
+    audio_lo/audio_hi: audio-position sub-range this chunk's words can occupy
+    (from surrounding decoder anchors). DTW runs on the sliced matrix so a
+    chunk covering the window's tail can't be corner-to-corner mapped onto the
+    whole window. Returned times are window-absolute (audio_lo added back).
     """
     audio_cap = num_frames // 2
     weights = attn_weights[:, :, :audio_cap]
@@ -782,18 +814,30 @@ def _dtw_from_attention(
     matrix = matrix[len(tokenizer.sot_sequence) : -1]
     neg_matrix = -matrix.cpu().numpy()
 
+    lo = max(0, min(audio_lo, audio_cap))
+    hi = audio_cap if audio_hi is None else max(lo, min(audio_hi, audio_cap))
+    if hi - lo < 2:
+        return []
+    if lo > 0 or hi < audio_cap:
+        neg_matrix = np.ascontiguousarray(neg_matrix[:, lo:hi])
+
     if word_anchors or tag_anchors:
         _apply_anchor_bands(
             neg_matrix,
             external_words,
             external_word_tokens,
-            audio_cap,
+            hi - lo,
             word_anchors,
             tag_anchors,
             slack_frames,
+            col_offset=lo,
         )
 
-    return _dtw_from_neg_matrix(neg_matrix, external_words, external_word_tokens)
+    result = _dtw_from_neg_matrix(neg_matrix, external_words, external_word_tokens)
+    if lo > 0 and result:
+        off = lo / TOKENS_PER_SECOND
+        result = [(w, s + off, e + off) for w, s, e in result]
+    return result
 
 
 def _find_alignment_chunk(
@@ -809,6 +853,8 @@ def _find_alignment_chunk(
     word_anchors: list[tuple[int, float, float]] | None = None,
     tag_anchors: list[tuple[float, float, int | None, int | None]] | None = None,
     slack_frames: int = 7,
+    audio_lo: int = 0,
+    audio_hi: int | None = None,
 ) -> list[tuple[str, float, float]]:
     """One decoder parallel forward + DTW for ONE chunk. Returns (word, start,
     end) per word group in `external_words` (drops the trailing eot group)."""
@@ -839,10 +885,140 @@ def _find_alignment_chunk(
         word_anchors=word_anchors,
         tag_anchors=tag_anchors,
         slack_frames=slack_frames,
+        audio_lo=audio_lo,
+        audio_hi=audio_hi,
     )
 
 
 # ---------- Public entry points ----------
+
+
+def _chunk_audio_bounds(
+    recs: list[dict | None],
+    pred_words_flat: list[tuple[str, float | None, float | None]],
+    win_dur: float,
+    overlap_slack: float = 5.0,
+) -> list[tuple[float, float] | None]:
+    """Per prepared chunk: the (lo, hi) window-audio sub-range its words can
+    plausibly occupy, derived from the nearest decoder-emitted timestamps
+    OUTSIDE the chunk. Replaces the old post-hoc anchor/prev-end shift: the
+    DTW search itself is restricted, so fills are in-range by construction.
+
+    overlap_slack mirrors the decoder's own line-start rule (timings may go
+    back up to 5 s for overlapping speakers), so legitimate overlaps aren't
+    squeezed. A chunk's own anchors always widen the range to contain them.
+    """
+    bounds: list[tuple[float, float] | None] = []
+    for rec in recs:
+        if rec is None:
+            bounds.append(None)
+            continue
+        gids = [oi for oi, _ in rec["tagged"] if oi is not None]
+        if not gids:
+            bounds.append((0.0, win_dur))
+            continue
+        g0, g1 = min(gids), max(gids)
+        lo = 0.0
+        for gi in range(g0 - 1, -1, -1):
+            _w, dec_s, dec_e = pred_words_flat[gi]
+            t = dec_e if dec_e is not None else dec_s
+            if t is not None:
+                lo = max(0.0, t - overlap_slack)
+                break
+        hi = win_dur
+        for gi in range(g1 + 1, len(pred_words_flat)):
+            _w, dec_s, dec_e = pred_words_flat[gi]
+            t = dec_s if dec_s is not None else dec_e
+            if t is not None:
+                hi = min(win_dur, t + overlap_slack)
+                break
+        # The chunk's own decoder anchors are ground truth — contain them.
+        for _i, a_s, a_e in rec["word_anchors"]:
+            lo = min(lo, max(0.0, a_s - 0.5))
+            hi = max(hi, min(win_dur, a_e + 0.5))
+        for a_s, a_e, _p, _n in rec["tag_anchors"]:
+            lo = min(lo, max(0.0, a_s - 0.5))
+            hi = max(hi, min(win_dur, a_e + 0.5))
+        if hi - lo < 0.2:
+            lo, hi = 0.0, win_dur
+        bounds.append((lo, hi))
+    return bounds
+
+
+def _drop_bad_fills(
+    lines: list[tuple[int | str, list[tuple[int, str, float | None, float | None]]]],
+    pred_words_flat: list[tuple[str, float | None, float | None]],
+    out_timings: list[tuple[float, float] | None],
+    win_dur: float,
+    tag_anchors: list[tuple[float, float, int | None, int | None]] | None = None,
+    tol: float = 0.02,
+) -> None:
+    """In-place safety net over DTW fills: a fill that runs past the window's
+    real audio, or breaks monotonicity against its own line's decoder
+    timestamps (word AND timed-tag) / accepted fills, is dropped (the word
+    stays untimed — valid WhisperDRZ format) instead of being emitted wrong.
+    Backsteps within tol are clamped rather than dropped."""
+    # Timed tags ([breath], [pause], ...) sit BETWEEN words but carry decoder
+    # timestamps; fills must be monotonic against them too.
+    tag_after: dict[int, float] = {}  # word gi is preceded by a tag ending here
+    tag_before: dict[int, float] = {}  # word gi is followed by a tag starting here
+    for a_s, a_e, p_gi, n_gi in tag_anchors or []:
+        if n_gi is not None:
+            tag_after[n_gi] = max(tag_after.get(n_gi, 0.0), a_e)
+        if p_gi is not None:
+            tag_before[p_gi] = min(tag_before.get(p_gi, float("inf")), a_s)
+
+    for _spk, line_ws in lines:
+        # Forward pass: fills must not go backwards or past the audio end.
+        last_t: float | None = None
+        for orig_idx, _w, dec_s, dec_e in line_ws:
+            ta = tag_after.get(orig_idx)
+            if ta is not None:
+                last_t = ta if last_t is None else max(last_t, ta)
+            if dec_s is not None or dec_e is not None:
+                t = dec_e if dec_e is not None else dec_s
+                last_t = t if last_t is None else max(last_t, t)
+                continue
+            ft = out_timings[orig_idx]
+            if ft is None:
+                continue
+            s, e = ft
+            tb = tag_before.get(orig_idx)
+            if (
+                s < -0.01
+                or e > win_dur + 0.25
+                or (last_t is not None and s < last_t - tol)
+                or (tb is not None and e > tb + tol)
+            ):
+                out_timings[orig_idx] = None
+                continue
+            if last_t is not None and s < last_t:
+                s = last_t  # clamp sub-tol backstep to keep the grid monotonic
+                e = max(e, s)
+                out_timings[orig_idx] = (s, e)
+            last_t = max(last_t, e) if last_t is not None else e
+        # Backward pass: fills must not overrun the next decoder timestamp.
+        next_t: float | None = None
+        for orig_idx, _w, dec_s, dec_e in reversed(line_ws):
+            tb = tag_before.get(orig_idx)
+            if tb is not None:
+                next_t = tb if next_t is None else min(next_t, tb)
+            if dec_s is not None or dec_e is not None:
+                t = dec_s if dec_s is not None else dec_e
+                next_t = t if next_t is None else min(next_t, t)
+                continue
+            ft = out_timings[orig_idx]
+            if ft is None:
+                continue
+            s, e = ft
+            if next_t is not None and e > next_t + tol:
+                out_timings[orig_idx] = None
+                continue
+            if next_t is not None and e > next_t:
+                e = next_t  # clamp sub-tol overrun
+                s = min(s, e)
+                out_timings[orig_idx] = (s, e)
+            next_t = s if next_t is None else min(next_t, s)
 
 
 def fill_word_timings(
@@ -870,7 +1046,10 @@ def fill_word_timings(
         max_tokens: chunk budget below the decoder positional-embedding cap.
 
     Returns: pred_text with one <|t|>word<|t|> per real word. Decoder-emitted
-    timings are kept where present; DTW fills the rest.
+    timings are kept where present; DTW fills the rest. Each chunk's DTW is
+    restricted to the audio sub-range implied by surrounding decoder
+    timestamps (see _chunk_audio_bounds), and fills that would still land
+    out-of-range or non-monotonic are dropped (_drop_bad_fills).
     """
     if head_mask is None:
         head_mask = make_head_mask(model)
@@ -882,98 +1061,46 @@ def fill_word_timings(
         return pred_text
 
     chunks = chunk_speaker_lines(lines, tokenizer, max_tokens)
+    recs = [
+        _prepare_chunk(cl, tokenizer, pred_words_flat, tag_anchors_global, max_tokens)
+        for cl in chunks
+    ]
+    win_dur = (num_frames // 2) / TOKENS_PER_SECOND
+    bounds = _chunk_audio_bounds(recs, pred_words_flat, win_dur)
     out_timings: list[tuple[float, float] | None] = [None] * len(pred_words_flat)
-    prev_last_end: float | None = None
 
-    for ci, chunk_lines in enumerate(chunks):
-        rendered, tagged = _render_chunk(chunk_lines)
-        ids, ext_words, ext_word_tokens = tokens_chars(rendered, tokenizer)
-        if len(ids) < 3 or len(ids) > max_tokens:
+    for rec, bnd in zip(recs, bounds, strict=False):
+        if rec is None or bnd is None:
             continue
-        if len(tagged) != len(ext_words) - 1:
-            continue
-
-        # Build word and tag anchors for this chunk.
-        word_anchors: list[tuple[int, float, float]] = []
-        gi_to_local: dict[int, int] = {}
-        for i, (orig_idx, _surf) in enumerate(tagged):
-            if orig_idx is None:
-                continue
-            gi_to_local[orig_idx] = i
-            _w, dec_s, dec_e = pred_words_flat[orig_idx]
-            if dec_s is not None and dec_e is not None:
-                word_anchors.append((i, dec_s, dec_e))
-        tag_anchors_local: list[tuple[float, float, int | None, int | None]] = []
-        for a_s, a_e, p_gi, n_gi in tag_anchors_global:
-            p_local = gi_to_local.get(p_gi) if p_gi is not None else None
-            n_local = gi_to_local.get(n_gi) if n_gi is not None else None
-            if p_local is None and n_local is None:
-                continue
-            tag_anchors_local.append((a_s, a_e, p_local, n_local))
-
+        lo, hi = bnd
         dtw = _find_alignment_chunk(
             model,
             tokenizer,
             xa,
-            ids,
-            ext_words,
-            ext_word_tokens,
+            rec["ids"],
+            rec["ext_words"],
+            rec["ext_word_tokens"],
             head_mask,
             num_frames,
-            word_anchors=word_anchors,
-            tag_anchors=tag_anchors_local,
+            word_anchors=rec["word_anchors"],
+            tag_anchors=rec["tag_anchors"],
+            audio_lo=int(lo * TOKENS_PER_SECOND),
+            audio_hi=round(hi * TOKENS_PER_SECOND),
         )
         if not dtw:
             continue
 
         # DTW returns len(ext_words) - 1 entries (eot dummy dropped); aligned 1:1 with `tagged`.
-        chunk_word_t: list[tuple[float, float] | None] = [None] * len(tagged)
-        for i in range(min(len(dtw), len(tagged))):
+        tagged = rec["tagged"]
+        for i, (orig_idx, _surf) in enumerate(tagged):
+            if orig_idx is None or i >= len(dtw):
+                continue
             _w, ds, de = dtw[i]
-            chunk_word_t[i] = (float(ds), float(de))
+            out_timings[orig_idx] = (float(ds), float(de))
 
-        # Anchor selection: earliest decoder-emitted timestamp on a real word.
-        anchor_local: int | None = None
-        anchor_t: float | None = None
-        for i, (orig_idx, _surf) in enumerate(tagged):
-            if orig_idx is None:
-                continue
-            _w, dec_s, _ = pred_words_flat[orig_idx]
-            if dec_s is not None and chunk_word_t[i] is not None:
-                anchor_local = i
-                anchor_t = dec_s
-                break
-
-        # Chunk 0: DTW already absolute (audio starts at t=0). Don't shift —
-        # the decoder/DTW disagreement at the anchor would propagate to every word.
-        if ci == 0:
-            shift = 0.0
-        elif anchor_t is not None and anchor_local is not None:
-            shift = anchor_t - chunk_word_t[anchor_local][0]
-        elif prev_last_end is not None:
-            first_real = next(
-                (
-                    chunk_word_t[i]
-                    for i, (oi, _) in enumerate(tagged)
-                    if oi is not None and chunk_word_t[i] is not None
-                ),
-                None,
-            )
-            shift = prev_last_end - first_real[0] if first_real else 0.0
-        else:
-            shift = 0.0
-
-        last_end = None
-        for i, (orig_idx, _surf) in enumerate(tagged):
-            if orig_idx is None or chunk_word_t[i] is None:
-                continue
-            s = chunk_word_t[i][0] + shift
-            e = chunk_word_t[i][1] + shift
-            out_timings[orig_idx] = (s, e)
-            last_end = e
-        if last_end is not None:
-            prev_last_end = last_end
-
+    _drop_bad_fills(
+        lines, pred_words_flat, out_timings, win_dur, tag_anchors=tag_anchors_global
+    )
     return rebuild_with_timings(pred_text, pred_words_flat, out_timings)
 
 
@@ -1006,16 +1133,28 @@ def rebuild_with_timings(
 
     Order in `pred_words_flat` and `dtw_timings` corresponds to the order
     real words appear in `pred_text`.
+
+    Injection is gated on line-monotonicity against EVERY timestamp token in
+    the original text — including stray/orphan timestamps that carry no word
+    (e.g. a bare line-start `<|t|>`), which the word/tag-level guard can't
+    see. A fill that would go backwards vs the last timestamp on the line is
+    skipped (sub-grid backsteps are clamped).
     """
     out: list[str] = []
     word_idx = 0
+    last_ts: float | None = None  # last timestamp value emitted on this line
     for m in _PARSE_TOKEN.finditer(pred_text):
         s = m.group(0)
+        if "\n" in s:
+            last_ts = None
         if (
             _TIMESTAMP_FULL.fullmatch(s)
             or _SPEAKER_FULL.fullmatch(s)
             or _BRACKET_TAG_FULL.fullmatch(s)
         ):
+            if s.startswith("<|"):
+                t = float(s[2:-2])
+                last_ts = t if last_ts is None else max(last_ts, t)
             out.append(s)
         elif s.startswith("<") and s.endswith(">"):
             out.append(s)  # metadata tag (<accent:..>, <emotion:..>, etc)
@@ -1032,7 +1171,15 @@ def rebuild_with_timings(
                 # Quantise to the 0.02 s WhisperDRZ grid.
                 ts = max(0.0, round(ts * 50) / 50)
                 te = max(ts, round(te * 50) / 50)
+                if last_ts is not None and ts < last_ts:
+                    if ts < last_ts - 0.02:
+                        out.append(s)  # backwards vs the line — leave untimed
+                        word_idx += 1
+                        continue
+                    ts = last_ts
+                    te = max(te, ts)
                 out.append(f"<|{ts:.2f}|>{s}<|{te:.2f}|>")
+                last_ts = te
             else:
                 out.append(s)
             word_idx += 1
@@ -1156,17 +1303,36 @@ def fill_word_timings_batch(
                 _prepare_chunk(chunk_lines, tokenizer, flat, tag_anchors, max_tokens)
             )
 
+    # Per-slot audio bounds for each chunk (window-position units), so a
+    # chunk's DTW searches only the sub-range implied by surrounding decoder
+    # timestamps rather than being corner-to-corner mapped onto the full window.
+    per_slot_bounds: list[list[tuple[float, float] | None]] = []
+    for si, recs in enumerate(per_slot_chunk_recs):
+        win_dur = (slot_data[si][2] // 2) / TOKENS_PER_SECOND
+        per_slot_bounds.append(
+            _chunk_audio_bounds(recs, per_slot_flat[si], win_dur) if recs else []
+        )
+
     # Collect every non-None chunk into a flat list for batching.
     pooled: list[tuple[int, int, dict]] = []  # (slot_idx, chunk_idx, rec)
-    ids_list, xa_list, num_frames_list = [], [], []
+    ids_list, xa_list, num_frames_list, bounds_pos = [], [], [], []
     for si, recs in enumerate(per_slot_chunk_recs):
         for ci, rec in enumerate(recs):
             if rec is None:
+                continue
+            bnd = per_slot_bounds[si][ci]
+            if bnd is None:
                 continue
             pooled.append((si, ci, rec))
             ids_list.append(rec["ids"])
             xa_list.append(slot_data[si][0])
             num_frames_list.append(slot_data[si][2])
+            bounds_pos.append(
+                (
+                    int(bnd[0] * TOKENS_PER_SECOND),
+                    round(bnd[1] * TOKENS_PER_SECOND),
+                )
+            )
 
     # Default outputs: unchanged pred_text where there was nothing to do.
     outs: list[str] = [data[1] for data in slot_data]
@@ -1206,7 +1372,12 @@ def fill_word_timings_batch(
         rec = pooled[bi][2]
         actual_len = actual_lens[bi]
         audio_cap = audio_caps_list[bi]
-        matrix = matrices_cpu[bi, sot_len : actual_len - 1, :audio_cap]
+        lo, hi = bounds_pos[bi]
+        lo = max(0, min(lo, audio_cap))
+        hi = max(lo, min(hi, audio_cap))
+        if hi - lo < 2:
+            return []
+        matrix = matrices_cpu[bi, sot_len : actual_len - 1, lo:hi]
         if matrix.shape[0] == 0 or matrix.shape[1] == 0:
             return []
         neg_matrix = np.ascontiguousarray(-matrix, dtype=np.float32)
@@ -1215,88 +1386,58 @@ def fill_word_timings_batch(
                 neg_matrix,
                 rec["ext_words"],
                 rec["ext_word_tokens"],
-                audio_cap,
+                hi - lo,
                 rec.get("word_anchors"),
                 rec.get("tag_anchors"),
                 slack_frames=7,
+                col_offset=lo,
             )
-        return _dtw_from_neg_matrix(
+        result = _dtw_from_neg_matrix(
             neg_matrix, rec["ext_words"], rec["ext_word_tokens"]
         )
+        if lo > 0 and result:
+            off = lo / TOKENS_PER_SECOND
+            result = [(w, s + off, e + off) for w, s, e in result]
+        return result
 
     if len(pooled) <= 1:
         dtw_results = [_dtw_one_chunk(bi) for bi in range(len(pooled))]
     else:
         dtw_results = list(_DTW_POOL.map(_dtw_one_chunk, range(len(pooled))))
 
-    # Per-slot anchor-stitching pass over the parallel DTW results.
+    # Per-slot assembly. No stitch shift: each chunk's DTW ran on its own
+    # bounded audio sub-range, so times are already window-absolute. (The old
+    # anchor/prev-end shift chained errors across chunks and pushed fills up
+    # to a full window-length past the real audio.)
     per_slot_out_timings: list[list[tuple[float, float] | None] | None] = [
         None
     ] * n_slots
-    per_slot_prev_end: list[float | None] = [None] * n_slots
-    per_slot_chunk_count: list[int] = [0] * n_slots
 
-    for bi, (si, ci, rec) in enumerate(pooled):
+    for bi, (si, _ci, rec) in enumerate(pooled):
         dtw = dtw_results[bi]
         if not dtw:
-            per_slot_chunk_count[si] += 1
             continue
-
-        tagged = rec["tagged"]
-        chunk_word_t: list[tuple[float, float] | None] = [None] * len(tagged)
-        for i in range(min(len(dtw), len(tagged))):
-            _w, ds, de = dtw[i]
-            chunk_word_t[i] = (float(ds), float(de))
-
-        # Anchor shift (same as fill_word_timings serial path).
-        anchor_local: int | None = None
-        anchor_t: float | None = None
         flat = per_slot_flat[si]
-        for i, (orig_idx, _surf) in enumerate(tagged):
-            if orig_idx is None:
-                continue
-            _w, dec_s, _ = flat[orig_idx]
-            if dec_s is not None and chunk_word_t[i] is not None:
-                anchor_local = i
-                anchor_t = dec_s
-                break
-
-        local_chunk_idx = per_slot_chunk_count[si]
-        if local_chunk_idx == 0:
-            shift = 0.0
-        elif anchor_t is not None and anchor_local is not None:
-            shift = anchor_t - chunk_word_t[anchor_local][0]
-        elif per_slot_prev_end[si] is not None:
-            first_real = next(
-                (
-                    chunk_word_t[i]
-                    for i, (oi, _) in enumerate(tagged)
-                    if oi is not None and chunk_word_t[i] is not None
-                ),
-                None,
-            )
-            shift = per_slot_prev_end[si] - first_real[0] if first_real else 0.0
-        else:
-            shift = 0.0
-
         if per_slot_out_timings[si] is None:
             per_slot_out_timings[si] = [None] * len(flat)
-
-        last_end = None
+        tagged = rec["tagged"]
         for i, (orig_idx, _surf) in enumerate(tagged):
-            if orig_idx is None or chunk_word_t[i] is None:
+            if orig_idx is None or i >= len(dtw):
                 continue
-            s = chunk_word_t[i][0] + shift
-            e = chunk_word_t[i][1] + shift
-            per_slot_out_timings[si][orig_idx] = (s, e)
-            last_end = e
-        if last_end is not None:
-            per_slot_prev_end[si] = last_end
-        per_slot_chunk_count[si] += 1
+            _w, ds, de = dtw[i]
+            per_slot_out_timings[si][orig_idx] = (float(ds), float(de))
 
     for si in range(n_slots):
         if per_slot_out_timings[si] is None:
             continue
+        win_dur = (slot_data[si][2] // 2) / TOKENS_PER_SECOND
+        _drop_bad_fills(
+            per_slot_lines[si],
+            per_slot_flat[si],
+            per_slot_out_timings[si],
+            win_dur,
+            tag_anchors=per_slot_tag_anchors[si],
+        )
         outs[si] = rebuild_with_timings(
             slot_data[si][1], per_slot_flat[si], per_slot_out_timings[si]
         )

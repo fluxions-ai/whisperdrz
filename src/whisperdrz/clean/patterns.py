@@ -22,6 +22,9 @@ _TIMING_CORE = _TIMESTAMP
 # <|1.23|> -> captures "1.23"
 TIMINGS_FORMAT = re.compile(rf"<\|({_FLOAT})\|>")
 
+# <|0.00|>word<|0.50|> -> captures start, word, end
+TIMESTAMP_WORD = re.compile(rf"<\|({_FLOAT})\|>([^<]*)<\|({_FLOAT})\|>")
+
 # =============================================================================
 # SPEAKERS  -  [0] Hello [1] Hi
 # =============================================================================

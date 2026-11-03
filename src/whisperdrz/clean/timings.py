@@ -17,6 +17,7 @@ from .patterns import (
     _FLOAT_PATTERN,
     _TIMING_CORE,
     SCORED_TIMING_PATTERN,
+    TIMESTAMP_WORD,
     TIMINGS_FORMAT,
 )
 
@@ -196,38 +197,106 @@ def remove_invalid_timing_pairs(text: str, min_duration: float = 0.02) -> str:
     return text
 
 
-def fix_nonmonotonic_timestamps(text: str) -> str:
-    """Fix backwards timestamps within each line.
+def _line_timing_units(line: str) -> list[tuple[float, float, list[tuple[int, int]]]]:
+    """Group a line's timestamps into droppable units.
 
-    Within a single line, timestamps must be monotonically non-decreasing.
-    If a timestamp goes backwards, clamp it to the previous value + 0.02s.
+    A unit is a `<|s|>word<|e|>` pair (both timestamps drop together, keeping
+    the word) or a lone timestamp. Returns (t_first, t_last, spans) per unit,
+    where spans are the character ranges of just the timestamp tokens.
+    """
+    units: list[tuple[float, float, list[tuple[int, int]]]] = []
+    covered: list[tuple[int, int]] = []
+    for m in TIMESTAMP_WORD.finditer(line):
+        t0, t1 = float(m.group(1)), float(m.group(3))
+        ts0_end = m.start() + len(m.group(1)) + 4  # <| ... |>
+        ts1_start = m.end() - (len(m.group(3)) + 4)
+        units.append((t0, t1, [(m.start(), ts0_end), (ts1_start, m.end())]))
+        covered.append((m.start(), m.end()))
+    for m in TIMINGS_FORMAT.finditer(line):
+        if any(s <= m.start() < e for s, e in covered):
+            continue
+        t = float(m.group(1))
+        units.append((t, t, [(m.start(), m.end())]))
+    units.sort(key=lambda u: u[2][0][0])
+    return units
 
-    Examples:
-        "<|26.68|>I'm<|26.78|> <|26.08|>doing.<|27.08|>"
-        -> "<|26.68|>I'm<|26.78|> <|26.80|>doing.<|27.08|>"
+
+def fix_nonmonotonic_timestamps(text: str, max_time: float | None = None) -> str:
+    """Make each line's timestamps monotonic by DROPPING outlier timing units.
+
+    The old behaviour clamped a backwards timestamp to the previous value
+    + 0.02s — so a single hallucinated far-forward timestamp poisoned every
+    later (correct, lower) timestamp on the line, flattening whole lines into
+    0.02s staircases. Instead, keep the longest non-decreasing chain of timing
+    units and strip the rest; their words simply become untimed, which is
+    valid WhisperDRZ format.
+
+    max_time: when given (the audio length of the window), units starting
+    beyond it are dropped outright — they can't be real no matter how
+    internally consistent they look.
+
+    Example (the backwards unit is dropped, its neighbours keep their times):
+        "<|26.68|>I'm<|26.78|> <|26.08|>doing.<|27.08|> <|27.08|>ok<|27.30|>"
+        -> "<|26.68|>I'm<|26.78|> doing. <|27.08|>ok<|27.30|>"
     """
     result_lines = []
     for line in text.split("\n"):
-        matches = list(TIMINGS_FORMAT.finditer(line))
-        if len(matches) < 2:
+        units = _line_timing_units(line)
+        if not units:
             result_lines.append(line)
             continue
 
-        last_t = float(matches[0].group(1))
-        replacements = []
-        for m in matches[1:]:
-            t = float(m.group(1))
-            if t < last_t:
-                new_t = last_t + 0.02
-                replacements.append((m.start(), m.end(), f"<|{new_t:.2f}|>"))
-                last_t = new_t
+        candidates = []  # indices eligible for the monotonic chain
+        forced_drop = set()
+        for i, (t0, t1, _spans) in enumerate(units):
+            if (
+                t1 < t0 - 0.001  # internally backwards pair
+                or (max_time is not None and t0 > max_time + 0.02)
+                # 0.5s slack: a word straddling the chunk boundary may
+                # legitimately end slightly past the audio; a far-out end is bogus.
+                or (max_time is not None and t1 > max_time + 0.5)
+            ):
+                forced_drop.add(i)
             else:
-                last_t = t
+                candidates.append(i)
 
-        if replacements:
-            for start, end, repl in reversed(replacements):
-                line = line[:start] + repl + line[end:]
+        # Longest non-decreasing chain over candidate units (O(n^2), n small).
+        # Tie-break on smaller ending time so impossible late tails lose.
+        best_len = [0] * len(units)
+        best_prev = [-1] * len(units)
+        for ci, i in enumerate(candidates):
+            best_len[i] = 1
+            for j in candidates[:ci]:
+                if units[i][0] >= units[j][1] - 0.001 and (
+                    best_len[j] + 1 > best_len[i]
+                    or (
+                        best_len[j] + 1 == best_len[i]
+                        and best_prev[i] != -1
+                        and units[j][1] < units[best_prev[i]][1]
+                    )
+                ):
+                    best_len[i] = best_len[j] + 1
+                    best_prev[i] = j
+        keep: set[int] = set()
+        if candidates:
+            end = max(
+                candidates,
+                key=lambda i: (best_len[i], -units[i][1]),
+            )
+            while end != -1:
+                keep.add(end)
+                end = best_prev[end]
 
+        drops = [i for i in range(len(units)) if i not in keep]
+        if not drops:
+            result_lines.append(line)
+            continue
+        spans_to_remove = sorted(
+            (span for i in drops for span in units[i][2]), reverse=True
+        )
+        for s, e in spans_to_remove:
+            line = line[:s] + line[e:]
+        line = re.sub(r" {2,}", " ", line).rstrip()
         result_lines.append(line)
     return "\n".join(result_lines)
 
@@ -235,49 +304,79 @@ def fix_nonmonotonic_timestamps(text: str) -> str:
 def remove_short_nonspeech(text: str, min_duration_s: float = 0.02) -> str:
     """Remove non-speech tags with duration <= min_duration_s.
 
-    Matches tags like [breath], [laugh] etc. with surrounding timings.
+    Only a tag wrapped in its OWN pair (`<|t1|>[tag]<|t2|>`, no spaces) is
+    removed, together with both timestamps. Allowing whitespace let the pattern
+    straddle an untimed tag between two words and delete one word's closing and
+    the next word's opening timestamp, welding them: `Hi<|0.30|> [breath]
+    <|0.32|>there` -> `Hithere`.
 
     Example:
-        "<|1.00|>[breath]<|1.01|>" -> "" (10ms, removed)
+        "a<|0.9|> <|1.00|>[breath]<|1.01|> <|1.1|>b" -> "a<|0.9|> <|1.1|>b" (10ms, removed)
         "<|1.00|>[breath]<|1.10|>" -> kept (100ms)
     """
 
     def replace_short_tag(match):
-        t1 = float(match.group(1))
-        t2 = float(match.group(3))
+        t1 = float(match.group(2))
+        t2 = float(match.group(4))
         if t2 - t1 <= min_duration_s + 0.001:  # Small epsilon for float precision
             return ""
         return match.group(0)
 
     return re.sub(
-        r"<\|([\d.]+)\|>\s*(\[[a-z]+\])\s*<\|([\d.]+)\|>", replace_short_tag, text
+        r"( ?)<\|([\d.]+)\|>(\[[a-z]+\])<\|([\d.]+)\|>", replace_short_tag, text
     )
 
 
 def remove_short_pauses(text: str, min_pause_ms: int = 800) -> str:
     """Remove [pause] tags that represent pauses shorter than min_pause_ms.
 
-    Matches [pause] tags with optional surrounding timings like:
-        <|1.00|>[pause]<|1.50|> - 500ms pause, removed if < 800ms
+    The whole `<|t1|>[pause]<|t2|>` pair goes, both timestamps with it. The old
+    version kept `<|t2|>` "so the next word is still timed", but the next word
+    already carries its own opening timestamp: the kept one was a lone marker
+    that shifted every positional timing pair after it on the line.
 
     Example:
-        "<|1.00|>[pause]<|1.50|>" with min_pause_ms=800 -> "<|1.50|>" (500ms removed, keep end timing)
+        "a<|1.00|> <|1.00|>[pause]<|1.50|> <|1.50|>b<|1.8|>" with min_pause_ms=800
+            -> "a<|1.00|> <|1.50|>b<|1.8|>" (500ms removed)
         "<|1.00|>[pause]<|2.00|>" with min_pause_ms=800 -> "<|1.00|>[pause]<|2.00|>" (1000ms kept)
     """
     min_pause_s = min_pause_ms / 1000.0
 
     def replace_short_pause(match):
-        t1 = float(match.group(1))
-        t2 = float(match.group(2))
-        gap = t2 - t1
-        if gap < min_pause_s:
-            # Keep ending timestamp so next word is still timed
-            return f"<|{t2:.2f}|>"
+        t1 = float(match.group(2))
+        t2 = float(match.group(3))
+        if t2 - t1 < min_pause_s:
+            return ""
         return match.group(0)
 
     return re.sub(
-        r"<\|([\d.]+)\|>\s*\[pause\]\s*<\|([\d.]+)\|>", replace_short_pause, text
+        r"( ?)<\|([\d.]+)\|>\[pause\]<\|([\d.]+)\|>", replace_short_pause, text
     )
+
+
+def remove_dangling_timestamps(text: str) -> str:
+    """Drop a timestamp that opens a pair at the very end of a line.
+
+    A window whose audio runs out right after an opening timestamp leaves
+    `word<|t1|> <|t2|>` on its last line. Once same-speaker lines are merged that
+    marker sits mid-line and every positional pair after it is misread
+    (`<|t2|> <|t3|>` becomes an empty pair). Only a marker with whitespace before
+    it and nothing but `[CHOP]` after it is dropped; a closing marker glued to its
+    word or tag is left alone.
+
+    Example:
+        "[0] <|0.00|>Plan<|0.44|> <|0.46|>[CHOP]" -> "[0] <|0.00|>Plan<|0.44|>[CHOP]"
+    """
+    lines = []
+    for line in text.split("\n"):
+        matches = list(TIMINGS_FORMAT.finditer(line))
+        if len(matches) % 2:
+            last = matches[-1]
+            head, tail = line[: last.start()], line[last.end() :]
+            if not tail.replace("[CHOP]", "").strip() and head[-1:].isspace():
+                line = head.rstrip() + tail.strip()
+        lines.append(line)
+    return "\n".join(lines)
 
 
 _SPEAKER_LINE_PATTERN = re.compile(r"^\[(\d+|c)\]", re.MULTILINE)

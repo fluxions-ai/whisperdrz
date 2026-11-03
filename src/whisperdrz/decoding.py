@@ -854,7 +854,12 @@ def sample_logits(
     if temperature == 0.0:
         return logits.argmax(dim=-1)
 
-    logits = logits / temperature
+    # In fp32: fp16 masked logits (-65504, x1.2 by the repetition penalty) / temperature overflow to
+    # -inf, and a row with nothing left (an idle slot, a fully masked state) softmaxes to NaN, which
+    # multinomial rejects with a device-side assert for the whole batch. Such rows take argmax.
+    greedy = logits.argmax(dim=-1)
+    all_masked = logits.max(dim=-1).values <= -60000
+    logits = logits.float() / temperature
 
     if top_k is not None:
         indices_to_remove = logits < torch.topk(logits, top_k)[0][..., -1, None]
@@ -872,7 +877,27 @@ def sample_logits(
         logits = logits.masked_fill(indices_to_remove, -torch.inf)
 
     probs = torch.softmax(logits, dim=-1)
-    return torch.multinomial(probs, num_samples=1).squeeze(-1)
+    bad = ~torch.isfinite(probs).all(dim=-1) | all_masked
+    probs = torch.where(bad.unsqueeze(-1), torch.ones_like(probs), probs)
+    sampled = torch.multinomial(probs, num_samples=1).squeeze(-1)
+    return torch.where(bad, greedy, sampled)
+
+
+_TOKEN_BYTES_CACHE: dict[int, bytes] = {}
+
+
+def _token_bytes(token_id: int) -> bytes:
+    """Raw bytes of a vocab token (for byte-fragment reassembly)."""
+    b = _TOKEN_BYTES_CACHE.get(token_id)
+    if b is None:
+        from whisperdrz.tokenizer import get_tokenizer
+
+        try:
+            b = get_tokenizer().encoding.decode_single_token_bytes(token_id)
+        except Exception:
+            b = b""
+        _TOKEN_BYTES_CACHE[token_id] = b
+    return b
 
 
 def update_state_after_decode(
@@ -882,6 +907,12 @@ def update_state_after_decode(
 
     Tracks token_count and last_token_id as Python ints (no GPU tensors).
     Automatically skips cur update for special tokens (language, transcribe, etc.)
+
+    Byte-fragment tokens (partial UTF-8, per-token decode contains '�';
+    reachable for languages whose mask unblocks them — see
+    get_dont_predict_for_lang) are buffered as raw bytes and appended to
+    `cur` only once they assemble a valid character, so `cur` never carries
+    replacement chars for chars like word-initial ё.
     """
     state.last_token_id = newtoken_id
     state.token_count += 1
@@ -897,7 +928,20 @@ def update_state_after_decode(
     ) or newtext == ""
 
     if not skip_cur and not is_special:
-        state.cur += newtext
+        if "�" in newtext:
+            pend = state._pending_bytes + _token_bytes(newtoken_id)
+            try:
+                state.cur += pend.decode("utf-8")
+                state._pending_bytes = b""
+            except UnicodeDecodeError as e:
+                if e.reason == "unexpected end of data" and len(pend) < 8:
+                    state._pending_bytes = pend  # still mid-character
+                else:
+                    state._pending_bytes = b""  # invalid sequence — drop
+        else:
+            if state._pending_bytes:
+                state._pending_bytes = b""  # interrupted fragment — drop partial
+            state.cur += newtext
 
     cur = state.cur
     line = _get_line(cur)
@@ -1338,11 +1382,15 @@ def decode_batch(
         # Asterisk state: odd count means we're inside `*...`
         in_asterisk, asterisk_force_close_reason = asterisk_state(line)
 
-        # Force timing near end OR before first word (if only tags timed so far)
+        # Force timing near end OR before first word (if only tags timed so far).
+        # force_timing_every_word opens EVERY word/tag with a timestamp; the
+        # close-before-space/newline corrections then finish each pair, so the
+        # output is <|t|>word<|t|> <|t|>word2<|t|> with nothing left untimed.
         force_timing = last_was_space and (
             near_end
             or (approaching_end and words_since_timing >= 2)
             or (even_timings and not _has_timed_word(line))
+            or (even_timings and state.force_timing_every_word)
         )
 
         # Classify into constraint groups
@@ -1930,15 +1978,19 @@ def decode_batch(
         # When model predicts a space-starting token after 5+ untimed words:
         # 1. Output just the space now
         # 2. Force timestamp on next iteration
+        # force_timing_every_word does this for EVERY space-prefixed token: a
+        # " versus" token would otherwise start the word with no opening
+        # timestamp. Splitting (rather than masking " versus") keeps the model's
+        # choice of a word over a newline; it re-predicts the word after <|t|>.
         MAX_WORDS_WITHOUT_TIMING = 5
-        if (
-            not correction_needed
-            and next_is_space
-            and not state.force_timing_every_word
-        ):
+        if not correction_needed and next_is_space:
             even_timings = ctx.get("even_timings", True)
             words_since = ctx.get("words_since_timing", 0)
-            if words_since >= MAX_WORDS_WITHOUT_TIMING and even_timings:
+            if state.force_timing_every_word:
+                split = newtext != " "
+            else:
+                split = words_since >= MAX_WORDS_WITHOUT_TIMING
+            if split and even_timings:
                 results[i] = (" ", ds._single_char_ids[" "])
                 state.force_timestamp_next = True
                 correction_needed = True

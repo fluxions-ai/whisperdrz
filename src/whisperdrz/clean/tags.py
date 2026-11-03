@@ -19,6 +19,8 @@ from .patterns import (
 _SPEAKER_AT_START_PATTERN = re.compile(rf"^\[({_DIGIT_PATTERN})\]")
 _INTERRUPTION_PATTERN = re.compile(rf"\[({_DIGIT_PATTERN})\s")
 _MULTI_SPACE_PATTERN = re.compile(r"  +")
+_TRAILING_TIMESTAMP = re.compile(r"<\|[\d.]+\|>$")
+_LEADING_TIMESTAMP = re.compile(r"<\|[\d.]+\|>")
 
 # Pre-compiled patterns for strip_tag_whitespace
 _BRACKET_CONTENT_PAT = re.compile(r"\[([^\]]+)\]")
@@ -122,9 +124,15 @@ def remove_orphan_paired_tags(text: str) -> str:
                 if not opening_before:
                     orphan_spans.append((cm.start(), cm.end()))
 
-        # Remove orphan spans from end to start to preserve positions
+        # Remove orphan spans from end to start to preserve positions. A timed
+        # orphan (`<|a|>[laughing]<|b|>`) takes its timing pair with it, or the
+        # line is left with an empty `<|a|><|b|>` pair.
         orphan_spans.sort(reverse=True)
         for start, end in orphan_spans:
+            before = _TRAILING_TIMESTAMP.search(line, 0, start)
+            after = _LEADING_TIMESTAMP.match(line, end)
+            if before and after:
+                start, end = before.start(), after.end()
             line = line[:start] + line[end:]
 
         # Clean up extra whitespace from removals

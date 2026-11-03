@@ -98,6 +98,8 @@ LANGUAGE_SCRIPT_COMPATIBILITY = {
             "mn",
             "uz",
             "tg",
+            "tt",
+            "ba",
         ],
         "allowed_scripts": [
             "LATIN",
@@ -113,13 +115,13 @@ LANGUAGE_SCRIPT_COMPATIBILITY = {
     },
     # Arabic script languages
     "arabic": {
-        "languages": ["ar", "fa", "ur", "ps"],
+        "languages": ["ar", "fa", "ur", "ps", "sd"],
         "allowed_scripts": ["LATIN", "ARABIC"],  # Latin for loanwords
         "allow_ascii_only": False,
     },
-    # Hebrew
+    # Hebrew script languages (Hebrew + Yiddish)
     "hebrew": {
-        "languages": ["he"],
+        "languages": ["he", "yi"],
         "allowed_scripts": ["LATIN", "HEBREW"],
         "allow_ascii_only": False,
     },
@@ -129,7 +131,8 @@ LANGUAGE_SCRIPT_COMPATIBILITY = {
         "allowed_scripts": ["LATIN", "CJK", "HIRAGANA", "KATAKANA", "HANGUL"],
         "allow_ascii_only": False,
     },
-    # Indian languages (Devanagari, Bengali, Tamil, etc.)
+    # Indian languages (Devanagari, Bengali, Tamil, etc.). Urdu is NOT here —
+    # it's Arabic-script and lives in the "arabic" group.
     "indic": {
         "languages": [
             "hi",
@@ -143,9 +146,9 @@ LANGUAGE_SCRIPT_COMPATIBILITY = {
             "pa",
             "or",
             "as",
-            "ur",
             "ne",
             "si",
+            "sa",
         ],
         "allowed_scripts": [
             "LATIN",
@@ -346,6 +349,117 @@ def get_blocked_tokens_for_language(language_code: str) -> tuple[int, ...]:
             blocked_tokens.append(token_id)
 
     return tuple(blocked_tokens)
+
+
+# UTF-8 byte ranges of each script's codepoint block, as (first_char, last_char)
+# encoded bytes. Used to unblock byte-fragment tokens per language group (see
+# get_fragment_tokens_to_unblock). Only scripts whose characters commonly lack
+# complete vocab tokens need an entry. A trailing partial character is allowed
+# iff it is a byte-prefix of some character in an allowed script's block —
+# UTF-8 byte order tracks codepoint order, so comparing the partial against the
+# truncated endpoints suffices. (A lead-byte-only check would be too coarse for
+# 3-byte scripts: 0xE0 starts Devanagari but also Thai, Lao, and Tibetan.)
+_SCRIPT_BYTE_RANGES = {
+    "CYRILLIC": ("\u0400".encode(), "\u052f".encode()),  # Cyrillic + supplement
+    "HEBREW": ("\u0590".encode(), "\u05ff".encode()),
+    "ARABIC": ("\u0600".encode(), "\u06ff".encode()),
+    "DEVANAGARI": ("\u0900".encode(), "\u097f".encode()),
+}
+
+
+def _partial_in_ranges(seq: bytes, ranges: list[tuple[bytes, bytes]]) -> bool:
+    """True if `seq` (an incomplete UTF-8 character) is a byte-prefix of some
+    character inside one of the (lo, hi) codepoint-block byte ranges."""
+    return any(lo[: len(seq)] <= seq <= hi[: len(seq)] for lo, hi in ranges)
+
+
+def _fragment_bytes_allowed(
+    core: bytes, ranges: list[tuple[bytes, bytes]], allowed_scripts: set[str]
+) -> bool:
+    """Walk a token's raw bytes (known NOT to be fully-valid UTF-8) and decide
+    whether everything it can contribute is compatible with the allowed
+    scripts: complete chars must be allowed-script/ASCII, and a trailing
+    partial character must be a byte-prefix of an allowed script's block.
+    Leading continuation bytes are fine — they finish a character started by
+    the PREVIOUS token, which was itself script-checked."""
+    i = 0
+    n = len(core)
+    while i < n and 0x80 <= core[i] <= 0xBF:
+        i += 1
+    while i < n:
+        b = core[i]
+        if b < 0x80:
+            i += 1
+            continue
+        if 0xC0 <= b <= 0xDF:
+            need = 1
+        elif 0xE0 <= b <= 0xEF:
+            need = 2
+        elif 0xF0 <= b <= 0xF7:
+            need = 3
+        else:
+            return False
+        seq = core[i : i + need + 1]
+        if len(seq) < need + 1:
+            # trailing partial character: must be a prefix of an allowed block
+            return _partial_in_ranges(seq, ranges)
+        try:
+            ch = seq.decode("utf-8")
+        except UnicodeDecodeError:
+            return False
+        script = _get_token_script(ch)
+        if script is not None and script not in allowed_scripts:
+            return False
+        i += need + 1
+    return True
+
+
+@lru_cache(maxsize=32)
+def get_fragment_tokens_to_unblock(language_code: str) -> tuple[int, ...]:
+    """Byte-fragment tokens (partial UTF-8; they decode to '�' standalone)
+    that a language legitimately needs to emit characters lacking a complete
+    vocab token — e.g. word-initial ё/Ё in Russian.
+
+    get_always_blocked_tokens blocks every '�'-containing token, which bans
+    those characters outright. This returns the SAFE subset to re-allow for a
+    language: fragments whose bytes can only produce allowed-script
+    characters. Pure continuation-byte tokens are included — they cannot
+    START a character, and every character's start bytes are still gated, so
+    an out-of-script character can never be assembled. Latin-script languages
+    return () (all their characters have complete tokens), so their masks are
+    unchanged.
+    """
+    if not language_code:
+        return ()
+    group = _get_language_group(language_code.lower())
+    if group is None:
+        return ()
+    allowed_scripts = set(group["allowed_scripts"])
+    ranges = [
+        _SCRIPT_BYTE_RANGES[s] for s in allowed_scripts if s in _SCRIPT_BYTE_RANGES
+    ]
+    if not ranges:
+        return ()
+
+    _get_vocab()  # ensure _tok is initialized
+    enc = _tok.encoding
+    out = []
+    for token_id in range(enc.n_vocab):
+        try:
+            bs = enc.decode_single_token_bytes(token_id)
+        except Exception:
+            continue
+        core = bs.lstrip(b" ")
+        if not core:
+            continue
+        try:
+            core.decode("utf-8")
+            continue  # fully valid UTF-8 — not a fragment
+        except UnicodeDecodeError:
+            pass
+        if _fragment_bytes_allowed(core, ranges, allowed_scripts):
+            out.append(token_id)
+    return tuple(out)
 
 
 @lru_cache(maxsize=32)

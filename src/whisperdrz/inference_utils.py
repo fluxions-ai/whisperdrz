@@ -196,7 +196,10 @@ def get_dont_predict_for_lang(lang: str | None) -> tuple[int, ...]:
     if lang in _dont_predict_for_lang_cache:
         return _dont_predict_for_lang_cache[lang]
 
-    from whisperdrz.vocab_constraints import get_blocked_tokens_for_language
+    from whisperdrz.vocab_constraints import (
+        get_blocked_tokens_for_language,
+        get_fragment_tokens_to_unblock,
+    )
 
     try:
         en_script = set(get_blocked_tokens_for_language("en"))
@@ -209,6 +212,10 @@ def get_dont_predict_for_lang(lang: str | None) -> tuple[int, ...]:
     dp = set(dont_predict)
     dp -= en_script
     dp |= tgt_script
+    # Re-allow the script-safe UTF-8 byte-fragment tokens this language needs
+    # for characters without a complete vocab token (e.g. word-initial ё).
+    # They're swept up by get_always_blocked_tokens' '�' blanket otherwise.
+    dp -= set(get_fragment_tokens_to_unblock(lang))
     result = tuple(sorted(dp))
     _dont_predict_for_lang_cache[lang] = result
     return result
@@ -246,6 +253,10 @@ class InferenceState:
     predict_next: str | None = None
     cached_len: int = 0  # Track how many tokens have been cached in KV
     stop_reason: str | None = None  # Why decoding stopped
+    # Raw bytes of UTF-8 byte-fragment tokens awaiting their continuation
+    # (chars with no complete vocab token, e.g. word-initial ё) — see
+    # update_state_after_decode.
+    _pending_bytes: bytes = b""
     speaker_hidden_states: list = field(
         default_factory=list
     )  # [(speaker_id, hidden_state), ...]
