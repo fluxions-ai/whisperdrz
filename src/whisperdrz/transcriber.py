@@ -39,6 +39,10 @@ class BucketedCUDAGraphs:
     Supports both modes:
     - return_hidden_states=False: faster, returns only logits
     - return_hidden_states=True: returns (logits, hidden_states) for speaker embeddings
+
+    A replay runs every row of its bucket, and each row appends its token's keys
+    and values to the cache of the slot it names, so the rows past the live ones
+    are given the first live row's step again (see `forward`).
     """
 
     def __init__(
@@ -166,6 +170,17 @@ class BucketedCUDAGraphs:
         self.static_tokens[bucket][:B].copy_(tokens)
         self.static_positions[bucket][:B].copy_(positions)
         self.static_slot_indices[bucket][:B].copy_(slot_indices)
+        if bucket > B:
+            # The rows past B repeat row 0's step (its token, position and slot),
+            # so they write the same keys and values to the same place. Left as an
+            # earlier replay's, a row appended its old token to whichever slot it
+            # named, at that slot's current position, racing the live row there:
+            # doubled words, cut-short and runaway decodes, and a chunk's text
+            # changing from run to run.
+            pad = bucket - B
+            self.static_tokens[bucket][B:].copy_(tokens[:1].expand(pad, -1))
+            self.static_positions[bucket][B:].copy_(positions[:1].expand(pad))
+            self.static_slot_indices[bucket][B:].copy_(slot_indices[:1].expand(pad))
 
         self.graphs[bucket].replay()
 
@@ -350,7 +365,9 @@ def extract_line_audio_segments(
     """Extract one audio tensor per speaker line for speaker embedding.
 
     For lines longer than max_duration, picks a random window of 3-max_duration
-    seconds. Speaker embedding models only need a few seconds of audio.
+    seconds. Speaker embedding models only need a few seconds of audio. The
+    windows are drawn from a generator seeded per call, so the same text and
+    audio give the same windows, embeddings and speaker tags every time.
 
     Returns:
         List of (line_index, speaker_id, audio_tensor) for lines with enough
@@ -358,6 +375,7 @@ def extract_line_audio_segments(
     """
     import random
 
+    rng = random.Random(0)
     segments = parse_to_segments(text)
     results = []
     min_window = 3.0
@@ -374,9 +392,9 @@ def extract_line_audio_segments(
         max_samples = int(max_duration * 16000)
         if duration_samples > max_samples:
             # Pick a random window between min_window and max_duration
-            window = int(random.uniform(min_window, max_duration) * 16000)
+            window = int(rng.uniform(min_window, max_duration) * 16000)
             window = min(window, duration_samples)
-            offset = random.randint(0, duration_samples - window)
+            offset = rng.randint(0, duration_samples - window)
             s_sample += offset
             e_sample = s_sample + window
         results.append((line_idx, seg["speaker"], audio[s_sample:e_sample]))
@@ -1238,23 +1256,29 @@ class Transcriber:
 
             xa = torch.stack(padded_batch, dim=0)
             xa = self.tomel(xa).to(self.device, self.dtype)  # Compute on CPU, then move
+        mels = xa
 
-        with flash_kernel():
-            xa = self.model.encoder(xa)
-        self.xa_cache[slot_tensor] = xa
-
-        # Prefill tokens (read directly from GPU buffer, no CPU→GPU copy)
+        # Encoder and prefill one chunk at a time: their fp16 results change with
+        # the batch's size, so batched, a chunk's encoding and first token
+        # depended on how many chunks were prefilled beside it.
         slot_states = [self.states[i] for i in slots]
-        tokens_batch = self.all_tokens[slot_tensor, : self.init_len]
-        logits = self.model.prefill_flash(
-            tokens_batch,
-            xa,
-            self.self_kv,
-            self.cross_kv,
-            slot_tensor,
-            return_hidden_states=False,
-        )
-        first_logits = logits[:, -1, :]
+        first_logits = []
+        for i in range(len(slots)):
+            slot_i = slot_tensor[i : i + 1]
+            with flash_kernel():
+                xa = self.model.encoder(mels[i : i + 1])
+            self.xa_cache[slot_i] = xa
+            # Prefill tokens (read directly from GPU buffer, no CPU→GPU copy)
+            logits = self.model.prefill_flash(
+                self.all_tokens[slot_i, : self.init_len],
+                xa,
+                self.self_kv,
+                self.cross_kv,
+                slot_i,
+                return_hidden_states=False,
+            )
+            first_logits.append(logits[:, -1, :])
+        first_logits = torch.cat(first_logits)
 
         # Decode first token (pass Python lists, no GPU→CPU copies)
         last_token_ids = [s.last_token_id for s in slot_states]
