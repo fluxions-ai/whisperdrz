@@ -182,6 +182,7 @@ from whisperdrz.clean import (
     merge_consecutive_speakers,
     reconcile_decoder_and_alignment_timings,
     remove_invalid_timing_pairs,
+    remove_dangling_timestamps,
     remove_orphan_paired_tags,
     remove_short_nonspeech,
     remove_short_pauses,
@@ -1379,6 +1380,7 @@ class Transcriber:
             cleaned = re.sub(r"\n{2,}", "\n", cleaned)
             cleaned = remove_short_nonspeech(cleaned, min_duration_s=0.02)
             cleaned = remove_short_pauses(cleaned, min_pause_ms=800)
+            cleaned = remove_dangling_timestamps(cleaned)
             # Remove orphaned timestamps: [0] <|t|> <|t2|> -> [0] <|t2|>
             cleaned = re.sub(r"(\[\d+\] )<\|[\d.]+\|> (<\|[\d.]+\|>)", r"\1\2", cleaned)
 

@@ -304,49 +304,79 @@ def fix_nonmonotonic_timestamps(text: str, max_time: float | None = None) -> str
 def remove_short_nonspeech(text: str, min_duration_s: float = 0.02) -> str:
     """Remove non-speech tags with duration <= min_duration_s.
 
-    Matches tags like [breath], [laugh] etc. with surrounding timings.
+    Only a tag wrapped in its OWN pair (`<|t1|>[tag]<|t2|>`, no spaces) is
+    removed, together with both timestamps. Allowing whitespace let the pattern
+    straddle an untimed tag between two words and delete one word's closing and
+    the next word's opening timestamp, welding them: `Hi<|0.30|> [breath]
+    <|0.32|>there` -> `Hithere`.
 
     Example:
-        "<|1.00|>[breath]<|1.01|>" -> "" (10ms, removed)
+        "a<|0.9|> <|1.00|>[breath]<|1.01|> <|1.1|>b" -> "a<|0.9|> <|1.1|>b" (10ms, removed)
         "<|1.00|>[breath]<|1.10|>" -> kept (100ms)
     """
 
     def replace_short_tag(match):
-        t1 = float(match.group(1))
-        t2 = float(match.group(3))
+        t1 = float(match.group(2))
+        t2 = float(match.group(4))
         if t2 - t1 <= min_duration_s + 0.001:  # Small epsilon for float precision
             return ""
         return match.group(0)
 
     return re.sub(
-        r"<\|([\d.]+)\|>\s*(\[[a-z]+\])\s*<\|([\d.]+)\|>", replace_short_tag, text
+        r"( ?)<\|([\d.]+)\|>(\[[a-z]+\])<\|([\d.]+)\|>", replace_short_tag, text
     )
 
 
 def remove_short_pauses(text: str, min_pause_ms: int = 800) -> str:
     """Remove [pause] tags that represent pauses shorter than min_pause_ms.
 
-    Matches [pause] tags with optional surrounding timings like:
-        <|1.00|>[pause]<|1.50|> - 500ms pause, removed if < 800ms
+    The whole `<|t1|>[pause]<|t2|>` pair goes, both timestamps with it. The old
+    version kept `<|t2|>` "so the next word is still timed", but the next word
+    already carries its own opening timestamp: the kept one was a lone marker
+    that shifted every positional timing pair after it on the line.
 
     Example:
-        "<|1.00|>[pause]<|1.50|>" with min_pause_ms=800 -> "<|1.50|>" (500ms removed, keep end timing)
+        "a<|1.00|> <|1.00|>[pause]<|1.50|> <|1.50|>b<|1.8|>" with min_pause_ms=800
+            -> "a<|1.00|> <|1.50|>b<|1.8|>" (500ms removed)
         "<|1.00|>[pause]<|2.00|>" with min_pause_ms=800 -> "<|1.00|>[pause]<|2.00|>" (1000ms kept)
     """
     min_pause_s = min_pause_ms / 1000.0
 
     def replace_short_pause(match):
-        t1 = float(match.group(1))
-        t2 = float(match.group(2))
-        gap = t2 - t1
-        if gap < min_pause_s:
-            # Keep ending timestamp so next word is still timed
-            return f"<|{t2:.2f}|>"
+        t1 = float(match.group(2))
+        t2 = float(match.group(3))
+        if t2 - t1 < min_pause_s:
+            return ""
         return match.group(0)
 
     return re.sub(
-        r"<\|([\d.]+)\|>\s*\[pause\]\s*<\|([\d.]+)\|>", replace_short_pause, text
+        r"( ?)<\|([\d.]+)\|>\[pause\]<\|([\d.]+)\|>", replace_short_pause, text
     )
+
+
+def remove_dangling_timestamps(text: str) -> str:
+    """Drop a timestamp that opens a pair at the very end of a line.
+
+    A window whose audio runs out right after an opening timestamp leaves
+    `word<|t1|> <|t2|>` on its last line. Once same-speaker lines are merged that
+    marker sits mid-line and every positional pair after it is misread
+    (`<|t2|> <|t3|>` becomes an empty pair). Only a marker with whitespace before
+    it and nothing but `[CHOP]` after it is dropped; a closing marker glued to its
+    word or tag is left alone.
+
+    Example:
+        "[0] <|0.00|>Plan<|0.44|> <|0.46|>[CHOP]" -> "[0] <|0.00|>Plan<|0.44|>[CHOP]"
+    """
+    lines = []
+    for line in text.split("\n"):
+        matches = list(TIMINGS_FORMAT.finditer(line))
+        if len(matches) % 2:
+            last = matches[-1]
+            head, tail = line[: last.start()], line[last.end() :]
+            if not tail.replace("[CHOP]", "").strip() and head[-1:].isspace():
+                line = head.rstrip() + tail.strip()
+        lines.append(line)
+    return "\n".join(lines)
 
 
 _SPEAKER_LINE_PATTERN = re.compile(r"^\[(\d+|c)\]", re.MULTILINE)

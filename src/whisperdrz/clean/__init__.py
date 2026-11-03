@@ -22,6 +22,7 @@ from .timings import (
     quantize_timestamps,
     reconcile_decoder_and_alignment_timings,
     remove_invalid_timing_pairs,
+    remove_dangling_timestamps,
     remove_short_nonspeech,
     remove_short_pauses,
 )
@@ -42,6 +43,7 @@ __all__ = [
     "remove_invalid_timing_pairs",
     "remove_orphan_paired_tags",
     "remove_short_nonspeech",
+    "remove_dangling_timestamps",
     "remove_short_pauses",
     "remove_speaker_tags_not_after_newline",
 ]
