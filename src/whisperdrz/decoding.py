@@ -854,7 +854,12 @@ def sample_logits(
     if temperature == 0.0:
         return logits.argmax(dim=-1)
 
-    logits = logits / temperature
+    # In fp32: fp16 masked logits (-65504, x1.2 by the repetition penalty) / temperature overflow to
+    # -inf, and a row with nothing left (an idle slot, a fully masked state) softmaxes to NaN, which
+    # multinomial rejects with a device-side assert for the whole batch. Such rows take argmax.
+    greedy = logits.argmax(dim=-1)
+    all_masked = logits.max(dim=-1).values <= -60000
+    logits = logits.float() / temperature
 
     if top_k is not None:
         indices_to_remove = logits < torch.topk(logits, top_k)[0][..., -1, None]
@@ -872,7 +877,10 @@ def sample_logits(
         logits = logits.masked_fill(indices_to_remove, -torch.inf)
 
     probs = torch.softmax(logits, dim=-1)
-    return torch.multinomial(probs, num_samples=1).squeeze(-1)
+    bad = ~torch.isfinite(probs).all(dim=-1) | all_masked
+    probs = torch.where(bad.unsqueeze(-1), torch.ones_like(probs), probs)
+    sampled = torch.multinomial(probs, num_samples=1).squeeze(-1)
+    return torch.where(bad, greedy, sampled)
 
 
 _TOKEN_BYTES_CACHE: dict[int, bytes] = {}
